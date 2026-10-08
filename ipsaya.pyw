@@ -33,7 +33,9 @@ import subprocess
 import threading
 import time
 import urllib.request
+import urllib.error
 import webbrowser
+import urllib.parse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -66,6 +68,9 @@ SPEED_DURATION = 8          # detik per tahap (download / upload)
 SPEED_THREADS = 4           # koneksi paralel supaya bandwidth terpakai penuh
 SPEED_SCALE = {"Mbps": 100.0, "MB/s": 20.0}   # skala maksimal gauge per satuan
 SPEED_UA = {"User-Agent": "IPInfoApp/1.0"}
+
+HTTP_TIMEOUT = 10
+HTTP_UA = "IPInfoApp/1.0 HTTP Checker"
 
 
 def make_button(parent, label, color):
@@ -224,6 +229,18 @@ def fetch_bytes(url):
     req = urllib.request.Request(url, headers={"User-Agent": "IPInfoApp/1.0"})
     with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
         return resp.read()
+
+
+def normalize_http_url(value):
+    value = value.strip()
+    if not value:
+        raise ValueError("Alamat web tidak boleh kosong.")
+    if not re.match(r"^https?://", value, re.I):
+        value = "https://" + value
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+        raise ValueError("URL tidak valid. Contoh: https://example.com")
+    return value
 
 
 class PingGraph(wx.Panel):
@@ -739,6 +756,7 @@ class MainFrame(wx.Frame):
         self.port_btn = make_button(panel, "PORT", GREEN)
         self.ipscan_btn = make_button(panel, "IP SCANNER", GREEN)
         self.speed_btn = make_button(panel, "SPEEDTEST", GREEN)
+        self.http_btn = make_button(panel, "HTTP CHECKER", GREEN)
         self.stop_btn = make_button(panel, "STOP", GREY)
         self.stop_btn.Disable()
 
@@ -747,7 +765,8 @@ class MainFrame(wx.Frame):
         brow1.Add(self.trace_btn, 1, wx.EXPAND | wx.RIGHT, 8)
         brow1.Add(self.port_btn, 1, wx.EXPAND | wx.RIGHT, 8)
         brow1.Add(self.ipscan_btn, 1, wx.EXPAND | wx.RIGHT, 8)
-        brow1.Add(self.speed_btn, 1, wx.EXPAND)
+        brow1.Add(self.speed_btn, 1, wx.EXPAND | wx.RIGHT, 8)
+        brow1.Add(self.http_btn, 1, wx.EXPAND)
         right.Add(brow1, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 16)
 
         # baris 2: STOP selebar penuh
@@ -798,6 +817,7 @@ class MainFrame(wx.Frame):
         self.port_btn.Bind(wx.EVT_BUTTON, lambda e: self.start_tool("port"))
         self.ipscan_btn.Bind(wx.EVT_BUTTON, lambda e: self.start_tool("ipscan"))
         self.speed_btn.Bind(wx.EVT_BUTTON, lambda e: self.start_tool("speedtest"))
+        self.http_btn.Bind(wx.EVT_BUTTON, lambda e: self.start_tool("http"))
         self.host.Bind(wx.EVT_TEXT_ENTER, lambda e: self.start_tool("ping"))
         self.stop_btn.Bind(wx.EVT_BUTTON, lambda e: self.stop_proc())
         self.rb_mbps.Bind(wx.EVT_RADIOBUTTON, self.on_unit)
@@ -910,7 +930,7 @@ class MainFrame(wx.Frame):
 
     # ------------------------------------------------- Network Tools (kanan)
     def set_busy(self, busy):
-        tools = (self.ping_btn, self.trace_btn, self.port_btn, self.ipscan_btn, self.speed_btn)
+        tools = (self.ping_btn, self.trace_btn, self.port_btn, self.ipscan_btn, self.speed_btn, self.http_btn)
         for b in tools:
             b.Enable(not busy)
             b.SetBackgroundColour(GREY if busy else GREEN)
@@ -1011,6 +1031,12 @@ class MainFrame(wx.Frame):
                     f"Contoh: {base}.1-{base}.254   atau   {base}.1-254",
                     "IP Scanner", wx.OK | wx.ICON_WARNING)
                 return
+        elif mode == "http":
+            try:
+                target = normalize_http_url(target)
+            except ValueError as exc:
+                wx.MessageBox(str(exc), "HTTP Checker", wx.OK | wx.ICON_WARNING)
+                return
         elif mode != "speedtest" and not re.fullmatch(r"[A-Za-z0-9.\-:_]+", target):
             wx.MessageBox("Alamat tidak valid.", "Network Tools", wx.OK | wx.ICON_WARNING)
             return
@@ -1047,10 +1073,11 @@ class MainFrame(wx.Frame):
         self.show_gauge(mode == "speedtest")
         self.update_stats()
         self.big.SetLabel("...")
+        self.big.SetForegroundColour(wx.Colour(30, 35, 45))
         self.running = True
         self.set_busy(True)
         names = {"ping": "PING", "tracert": "TRACERT", "port": "SCAN PORT",
-                 "ipscan": "IP SCANNER", "speedtest": "SPEEDTEST"}
+                 "ipscan": "IP SCANNER", "speedtest": "SPEEDTEST", "http": "HTTP CHECKER"}
         shown = target if mode != "speedtest" else SPEED_HOST
         self.SetStatusText(f"{names[mode]} {shown} berjalan...")
 
@@ -1060,6 +1087,8 @@ class MainFrame(wx.Frame):
             threading.Thread(target=self.ip_worker, args=ip_range, daemon=True).start()
         elif mode == "speedtest":
             threading.Thread(target=self.speed_worker, daemon=True).start()
+        elif mode == "http":
+            threading.Thread(target=self.http_worker, args=(target,), daemon=True).start()
         else:
             threading.Thread(target=self.tool_worker, args=(mode, cmd), daemon=True).start()
 
@@ -1199,6 +1228,62 @@ class MainFrame(wx.Frame):
             wx.CallAfter(self.append_log, f"Error: {e}")
         finally:
             wx.CallAfter(self.tool_finished)
+
+    # ---------------------------------------------------------- HTTP Checker
+    def http_worker(self, target):
+        try:
+            wx.CallAfter(self.append_log, f"HTTP Checker: {target}\n")
+            req = urllib.request.Request(
+                target,
+                headers={"User-Agent": HTTP_UA},
+                method="GET",
+            )
+            t0 = time.perf_counter()
+            try:
+                with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                    elapsed = (time.perf_counter() - t0) * 1000
+                    status = resp.status
+                    reason = getattr(resp, "reason", "") or ""
+                    final_url = resp.geturl()
+                    server = resp.headers.get("Server", "-")
+                    content_type = resp.headers.get("Content-Type", "-")
+                    content_length = resp.headers.get("Content-Length")
+                    body = resp.read(1024 * 1024)
+                    size = int(content_length) if content_length and content_length.isdigit() else len(body)
+                    wx.CallAfter(self.http_result, status, reason, elapsed, size,
+                                 server, content_type, final_url)
+            except urllib.error.HTTPError as e:
+                elapsed = (time.perf_counter() - t0) * 1000
+                wx.CallAfter(self.http_result, e.code, str(e.reason), elapsed, 0,
+                             e.headers.get("Server", "-") if e.headers else "-",
+                             e.headers.get("Content-Type", "-") if e.headers else "-",
+                             e.geturl())
+        except Exception as e:
+            wx.CallAfter(self.append_log, f"HTTP ERROR: {e}")
+        finally:
+            wx.CallAfter(self.tool_finished)
+
+    def http_result(self, status, reason, elapsed, size, server, content_type, final_url):
+        ok = 200 <= status < 400
+        status_text = f"{status} {reason}".strip()
+        color = GREEN if ok else RED
+        self.big.SetLabel(str(status))
+        self.big.SetForegroundColour(color)
+        self.stats_bar.set_lines([
+            [("status : ", StatsBar.DARK), (status_text, color),
+             ("  |  ", StatsBar.SEP), ("time : ", StatsBar.DARK),
+             (f"{elapsed:.0f} ms", StatsBar.DARK)],
+            [("size : ", StatsBar.DARK), (f"{size / 1024:.1f} KB", StatsBar.DARK),
+             ("  |  ", StatsBar.SEP), ("server : ", StatsBar.DARK), (server, StatsBar.DARK)],
+        ])
+        self.append_log(f"Status       : {status_text}")
+        self.append_log(f"Response time: {elapsed:.1f} ms")
+        self.append_log(f"Content-Type : {content_type}")
+        self.append_log(f"Size         : {size / 1024:.1f} KB")
+        self.append_log(f"Server       : {server}")
+        self.append_log(f"Final URL    : {final_url}")
+        self.append_log(f"Kesimpulan   : {'ONLINE / OK' if ok else 'HTTP ERROR'}")
+
 
     # ------------------------------------------------------------ Speedtest
     def on_unit(self, _evt):
@@ -1427,4 +1512,5 @@ if __name__ == "__main__":
     app = wx.App(False)
     frame = MainFrame()
     frame.Show()
+    frame.Maximize(True)
     app.MainLoop()
