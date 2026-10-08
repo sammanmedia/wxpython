@@ -5,6 +5,9 @@ KIRI  : IP publik beserta kota, negara, region, ISP, zona waktu,
         mata uang, koordinat, status proxy/hosting, dan bendera negara.
 KANAN : Form input IP / alamat web + tombol [PING] [TRACERT] [STOP]
         + grafik batang ping (ms) ala Winbox + statistik (avg/max/min/loss/time).
+        Tombol: [PING] [TRACERT] [PORT] [IP SCANNER] [STOP]
+        PORT       : scan port TCP 1-65535 pada IP / host yang diinput.
+        IP SCANNER : wajib rentang IP, mis. 192.168.1.1-192.168.1.254
 
 Instalasi : pip install wxPython
 Jalankan  : python ip_info_app.py
@@ -14,6 +17,7 @@ Bendera    : flagcdn.com
 """
 
 import io
+import ipaddress
 import json
 import platform
 import re
@@ -25,6 +29,7 @@ import time
 import urllib.request
 import webbrowser
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import wx
 from wx.lib.buttons import GenButton
@@ -77,6 +82,78 @@ def build_command(mode, target):
     if shutil.which("tracepath"):
         return ["tracepath", target]
     return None
+
+
+SCAN_WORKERS_PORT = 400   # jumlah thread scan port
+SCAN_WORKERS_IP = 128     # jumlah thread scan IP
+PORT_TIMEOUT = 0.5        # detik per port
+MAX_IP_RANGE = 65536      # batas jumlah IP sekali scan
+
+
+def parse_ip_range(text):
+    """Format wajib: 192.168.1.1-192.168.1.254 (boleh singkat: 192.168.1.1-254)."""
+    text = text.replace(" ", "")
+    if "-" not in text:
+        raise ValueError("Format harus rentang IP, mis. 192.168.1.1-192.168.1.254")
+    left, right = text.split("-", 1)
+    try:
+        start = ipaddress.IPv4Address(left)
+        if right.isdigit():
+            end = ipaddress.IPv4Address(".".join(left.split(".")[:3] + [right]))
+        else:
+            end = ipaddress.IPv4Address(right)
+    except ValueError:
+        raise ValueError("IP address tidak valid.")
+    if int(end) < int(start):
+        raise ValueError("IP akhir harus lebih besar dari IP awal.")
+    if int(end) - int(start) + 1 > MAX_IP_RANGE:
+        raise ValueError(f"Rentang terlalu besar (maksimal {MAX_IP_RANGE} IP).")
+    return int(start), int(end)
+
+
+def check_port(ip, port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(PORT_TIMEOUT)
+    try:
+        return sock.connect_ex((ip, port)) == 0
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def service_name(port):
+    try:
+        return socket.getservbyport(port, "tcp")
+    except OSError:
+        return "-"
+
+
+def ping_once(ip):
+    """Ping 1x. Return (hidup, teks_ms)."""
+    if IS_WINDOWS:
+        cmd = ["ping", "-n", "1", "-w", "800", ip]
+    elif platform.system() == "Darwin":
+        cmd = ["ping", "-c", "1", "-W", "1000", ip]
+    else:
+        cmd = ["ping", "-c", "1", "-W", "1", ip]
+    kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WINDOWS else {}
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=4, **kwargs)
+    except Exception:
+        return False, ""
+    out = r.stdout.decode(errors="replace")
+    if "ttl=" not in out.lower():       # TTL= hanya ada kalau benar-benar dibalas
+        return False, ""
+    m = TIME_RE.search(out)
+    return True, (m.group(1) + " ms" if m else "")
+
+
+def resolve_name(ip):
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except Exception:
+        return ""
 
 
 def fmt_ms(value):
@@ -301,6 +378,24 @@ class PingStats:
         return f"{secs // 60} menit : {secs % 60} detik"
 
 
+class ScanStats:
+    """Progres scan port / IP."""
+
+    def __init__(self, total):
+        self.total = total
+        self.done = 0
+        self.found = 0
+        self.t0 = time.monotonic()
+        self.t_end = None
+
+    def percent(self):
+        return self.done / self.total * 100 if self.total else 0
+
+    def elapsed_text(self):
+        secs = int((self.t_end or time.monotonic()) - self.t0)
+        return f"{secs // 60} menit : {secs % 60} detik"
+
+
 class StatsBar(wx.Panel):
     """Teks statistik tebal (2 baris) di samping angka ms. Mendukung warna per bagian."""
 
@@ -339,8 +434,8 @@ class StatsBar(wx.Panel):
 
 class MainFrame(wx.Frame):
     def __init__(self):
-        super().__init__(None, title="Info IP Saya + Network Tools", size=(1180, 700))
-        self.SetMinSize((1000, 620))
+        super().__init__(None, title="Info IP Saya + Network Tools", size=(1200, 700))
+        self.SetMinSize((1080, 620))
         self.ip_text = ""
         self.lat = None
         self.lon = None
@@ -348,6 +443,8 @@ class MainFrame(wx.Frame):
         self.proc = None
         self.running = False
         self.stats = PingStats()
+        self.mode = None
+        self.scan = None
         self.timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_timer, self.timer)
         self._build_ui()
@@ -454,7 +551,7 @@ class MainFrame(wx.Frame):
         """Sisi kanan: input IP / alamat web + PING, TRACERT, STOP + log."""
         right = wx.BoxSizer(wx.VERTICAL)
 
-        caption = wx.StaticText(panel, label="Network Tools - IP / Alamat Web")
+        caption = wx.StaticText(panel, label="Network Tools - IP / Alamat Web      (IP SCANNER: 192.168.1.1-192.168.1.254)")
         caption.SetForegroundColour(wx.Colour(100, 110, 125))
         right.Add(caption, 0, wx.LEFT | wx.RIGHT | wx.TOP, 16)
 
@@ -464,10 +561,14 @@ class MainFrame(wx.Frame):
         brow = wx.BoxSizer(wx.HORIZONTAL)
         self.ping_btn = make_button(panel, "PING", GREEN)
         self.trace_btn = make_button(panel, "TRACERT", GREEN)
+        self.port_btn = make_button(panel, "PORT", GREEN)
+        self.ipscan_btn = make_button(panel, "IP SCANNER", GREEN)
         self.stop_btn = make_button(panel, "STOP", GREY)
         self.stop_btn.Disable()
         brow.Add(self.ping_btn, 1, wx.EXPAND | wx.RIGHT, 8)
         brow.Add(self.trace_btn, 1, wx.EXPAND | wx.RIGHT, 8)
+        brow.Add(self.port_btn, 1, wx.EXPAND | wx.RIGHT, 8)
+        brow.Add(self.ipscan_btn, 1, wx.EXPAND | wx.RIGHT, 8)
         brow.Add(self.stop_btn, 1, wx.EXPAND)
         right.Add(brow, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 16)
 
@@ -496,6 +597,8 @@ class MainFrame(wx.Frame):
 
         self.ping_btn.Bind(wx.EVT_BUTTON, lambda e: self.start_tool("ping"))
         self.trace_btn.Bind(wx.EVT_BUTTON, lambda e: self.start_tool("tracert"))
+        self.port_btn.Bind(wx.EVT_BUTTON, lambda e: self.start_tool("port"))
+        self.ipscan_btn.Bind(wx.EVT_BUTTON, lambda e: self.start_tool("ipscan"))
         self.host.Bind(wx.EVT_TEXT_ENTER, lambda e: self.start_tool("ping"))
         self.stop_btn.Bind(wx.EVT_BUTTON, lambda e: self.stop_proc())
         self.Bind(wx.EVT_CLOSE, self.on_close)
@@ -606,20 +709,32 @@ class MainFrame(wx.Frame):
 
     # ------------------------------------------------- Network Tools (kanan)
     def set_busy(self, busy):
-        self.ping_btn.Enable(not busy)
-        self.trace_btn.Enable(not busy)
+        tools = (self.ping_btn, self.trace_btn, self.port_btn, self.ipscan_btn)
+        for b in tools:
+            b.Enable(not busy)
+            b.SetBackgroundColour(GREY if busy else GREEN)
         self.host.Enable(not busy)
         self.stop_btn.Enable(busy)
         # hijau saat aktif, abu-abu saat dikunci; STOP merah saat bisa dipakai
-        for b in (self.ping_btn, self.trace_btn):
-            b.SetBackgroundColour(GREY if busy else GREEN)
         self.stop_btn.SetBackgroundColour(RED if busy else GREY)
-        for b in (self.ping_btn, self.trace_btn, self.stop_btn):
+        for b in tools + (self.stop_btn,):
             b.Refresh()
 
     def update_stats(self):
         st = self.stats
         D, S = StatsBar.DARK, StatsBar.SEP
+
+        if self.mode in ("port", "ipscan") and self.scan is not None:
+            sc = self.scan
+            found_label = "port terbuka" if self.mode == "port" else "host aktif"
+            sep = ("  |  ", S)
+            self.stats_bar.set_lines([
+                [("scan : ", D), (f"{sc.percent():.1f}%", D), sep,
+                 ("dicek : ", D), (f"{sc.done}/{sc.total}", D)],
+                [(found_label + " : ", D), (str(sc.found), GREEN if sc.found else D), sep,
+                 ("time : ", D), (sc.elapsed_text(), D)],
+            ])
+            return
 
         ping_txt, ping_col = "--", D
         if st.last_lost:
@@ -645,36 +760,65 @@ class MainFrame(wx.Frame):
         self.stats_bar.set_lines([line1, line2])
 
     def on_timer(self, _evt):
-        if self.running and self.stats.t0 is not None:
+        if self.running:
             self.update_stats()
 
     def start_tool(self, mode):
         target = self.host.GetValue().strip()
         if not target or self.running:
             return
-        if not re.fullmatch(r"[A-Za-z0-9.\-:_]+", target):
+
+        ip_range = None
+        if mode == "ipscan":
+            try:
+                ip_range = parse_ip_range(target)
+            except ValueError as exc:
+                priv = get_private_ip()
+                base = priv.rsplit(".", 1)[0] if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", priv) else "192.168.1"
+                wx.MessageBox(
+                    f"{exc}\n\nIP SCANNER wajib memakai rentang IP address.\n"
+                    f"Contoh: {base}.1-{base}.254   atau   {base}.1-254",
+                    "IP Scanner", wx.OK | wx.ICON_WARNING)
+                return
+        elif not re.fullmatch(r"[A-Za-z0-9.\-:_]+", target):
             wx.MessageBox("Alamat tidak valid.", "Network Tools", wx.OK | wx.ICON_WARNING)
             return
 
-        cmd = build_command(mode, target)
-        if cmd is None:
-            wx.MessageBox("traceroute/tracepath tidak terpasang di sistem ini.",
-                          "Network Tools", wx.OK | wx.ICON_ERROR)
-            return
+        cmd = None
+        if mode in ("ping", "tracert"):
+            cmd = build_command(mode, target)
+            if cmd is None:
+                wx.MessageBox("traceroute/tracepath tidak terpasang di sistem ini.",
+                              "Network Tools", wx.OK | wx.ICON_ERROR)
+                return
 
+        self.mode = mode
         self.log.Clear()
         self.graph.clear()
+        self.scan = None
         if mode == "ping":
             self.stats.start()
-            self.timer.Start(1000)
         else:
             self.stats.reset()
+        if mode == "port":
+            self.scan = ScanStats(65535)
+        elif mode == "ipscan":
+            self.scan = ScanStats(ip_range[1] - ip_range[0] + 1)
+        if mode in ("ping", "port", "ipscan"):
+            self.timer.Start(1000)
         self.update_stats()
         self.big.SetLabel("...")
         self.running = True
         self.set_busy(True)
-        self.SetStatusText(f"{mode.upper()} ke {target} berjalan...")
-        threading.Thread(target=self.tool_worker, args=(mode, cmd), daemon=True).start()
+        names = {"ping": "PING", "tracert": "TRACERT", "port": "SCAN PORT", "ipscan": "IP SCANNER"}
+        self.SetStatusText(f"{names[mode]} {target} berjalan...")
+
+        if mode == "port":
+            threading.Thread(target=self.port_worker, args=(target,), daemon=True).start()
+        elif mode == "ipscan":
+            threading.Thread(target=self.ip_worker, args=ip_range, daemon=True).start()
+        else:
+            threading.Thread(target=self.tool_worker, args=(mode, cmd), daemon=True).start()
 
     def stop_proc(self):
         self.running = False
@@ -710,6 +854,108 @@ class MainFrame(wx.Frame):
         finally:
             wx.CallAfter(self.tool_finished)
 
+    def append_log(self, text):
+        self.log.AppendText(text + "\n")
+
+    def scan_progress(self, done, found):
+        if self.scan is None:
+            return
+        self.scan.done = done
+        self.scan.found = found
+        self.big.SetLabel(f"{self.scan.percent():.0f}%")
+        self.update_stats()
+
+    def port_worker(self, target):
+        """Scan port TCP 1-65535 (TCP connect scan)."""
+        try:
+            try:
+                ip = socket.gethostbyname(target)
+            except OSError:
+                wx.CallAfter(self.append_log, f"Host tidak ditemukan: {target}")
+                return
+            wx.CallAfter(self.append_log,
+                         f"Scan port TCP 1-65535 pada {target} ({ip})\n"
+                         "(port 0 dilewati: port cadangan, tidak bisa dikoneksikan)\n")
+
+            def probe(port):
+                return self.running and check_port(ip, port)
+
+            open_ports, done, last_ui = [], 0, 0.0
+            with ThreadPoolExecutor(max_workers=SCAN_WORKERS_PORT) as ex:
+                for first in range(1, 65536, 4000):
+                    if not self.running:
+                        break
+                    futures = {ex.submit(probe, p): p for p in range(first, min(first + 4000, 65536))}
+                    for fut in as_completed(futures):
+                        done += 1
+                        port = futures[fut]
+                        if fut.result():
+                            open_ports.append(port)
+                            wx.CallAfter(self.append_log, f"[+] PORT {port}/tcp  open  {service_name(port)}")
+                        now = time.monotonic()
+                        if now - last_ui > 0.2:
+                            last_ui = now
+                            wx.CallAfter(self.scan_progress, done, len(open_ports))
+                        if not self.running:
+                            for f in futures:
+                                f.cancel()
+                            break
+
+            wx.CallAfter(self.scan_progress, done, len(open_ports))
+            state = "selesai" if self.running else "dihentikan"
+            lines = ["", f"--- {state}: {len(open_ports)} port terbuka dari {done} port dicek ---"]
+            lines += [f"{p:>5}/tcp  open  {service_name(p)}" for p in sorted(open_ports)]
+            wx.CallAfter(self.append_log, "\n".join(lines))
+        except Exception as e:
+            wx.CallAfter(self.append_log, f"Error: {e}")
+        finally:
+            wx.CallAfter(self.tool_finished)
+
+    def ip_worker(self, start, end):
+        """Scan rentang IP dengan ping."""
+        try:
+            ips = [str(ipaddress.IPv4Address(i)) for i in range(start, end + 1)]
+            wx.CallAfter(self.append_log, f"Scan {ips[0]} - {ips[-1]} ({len(ips)} IP)\n")
+
+            def probe(ip):
+                if not self.running:
+                    return None
+                ok, ms = ping_once(ip)
+                return (ip, ms, resolve_name(ip)) if ok else None
+
+            alive, done, last_ui = [], 0, 0.0
+            with ThreadPoolExecutor(max_workers=SCAN_WORKERS_IP) as ex:
+                for first in range(0, len(ips), 2000):
+                    if not self.running:
+                        break
+                    futures = [ex.submit(probe, ip) for ip in ips[first:first + 2000]]
+                    for fut in as_completed(futures):
+                        done += 1
+                        r = fut.result()
+                        if r:
+                            alive.append(r)
+                            wx.CallAfter(self.append_log, f"[+] {r[0]:<15}  {r[1]:<8}  {r[2]}")
+                        now = time.monotonic()
+                        if now - last_ui > 0.2:
+                            last_ui = now
+                            wx.CallAfter(self.scan_progress, done, len(alive))
+                        if not self.running:
+                            for f in futures:
+                                f.cancel()
+                            break
+
+            wx.CallAfter(self.scan_progress, done, len(alive))
+            state = "selesai" if self.running else "dihentikan"
+            alive.sort(key=lambda r: int(ipaddress.IPv4Address(r[0])))
+            lines = ["", f"--- {state}: {len(alive)} host aktif dari {done} IP dicek ---"]
+            lines += [f"{r[0]:<15}  {r[1]:<8}  {r[2]}" for r in alive]
+            lines.append("(host yang memblokir ping tidak akan muncul)")
+            wx.CallAfter(self.append_log, "\n".join(lines))
+        except Exception as e:
+            wx.CallAfter(self.append_log, f"Error: {e}")
+        finally:
+            wx.CallAfter(self.tool_finished)
+
     def show_line(self, mode, line):
         self.log.AppendText(line + "\n")
         if mode == "ping":
@@ -739,9 +985,12 @@ class MainFrame(wx.Frame):
         self.running = False
         self.timer.Stop()
         self.stats.stop()
+        if self.scan is not None and self.scan.t_end is None:
+            self.scan.t_end = time.monotonic()
         self.update_stats()
         self.set_busy(False)
-        self.log.AppendText("--- selesai ---\n")
+        if self.mode in ("ping", "tracert"):
+            self.log.AppendText("--- selesai ---\n")
         self.SetStatusText("Siap")
 
 
