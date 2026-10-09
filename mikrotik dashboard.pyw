@@ -1,5 +1,5 @@
 """
-MikroTik Dashboard v3 (wxPython + librouteros)
+MikroTik Dashboard v4 (wxPython + librouteros)
 
 Install:
     pip install wxPython librouteros keyring
@@ -10,6 +10,9 @@ Alur:
     3. Dashboard    : info device + tombol KELUAR
                       Queue (atas 70%) | Interface (bawah 30%), sash bisa digeser
                       - Queue    : sort, bar usage (hijau/oranye/merah), double-click = grafik
+                                   kolom Total Download / Total Upload (di kanan Usage)
+                                   refresh rate queue bisa diatur (default 5 detik)
+                                   teks baris: >=100% merah bold, >=70% oranye bold, selain itu hitam
                       - Interface: double-click = grafik
                       - List belang abu-abu tipis & putih
 """
@@ -34,13 +37,20 @@ APP_NAME = "MikroTikDash"
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".mikrotik_dash.json")
 
 # ---- pengaturan grafik
-HISTORY_MAX = 900      # riwayat disimpan (detik) -> 15 menit
+HISTORY_MAX = 900      # riwayat disimpan (titik) -> 15 menit kalau 1 titik = 1 detik
 BAR_PX = 2             # lebar 1 batang (px)
 SLOT_PX = 3            # jarak antar batang (px); rapat & TETAP walau di-maximize
 
 # ---- pengaturan bar usage queue
 WARN_PCT = 50          # >= 50% oranye
 CRIT_PCT = 90          # >= 90% merah
+
+# ---- refresh queue & warna teks baris queue
+DEFAULT_Q_INTERVAL = 5       # detik (bisa diubah lewat input di bagian Queue)
+ROW_RED_PCT = 100            # >= 100% -> teks merah bold
+ROW_ORANGE_PCT = 70          # >= 70%  -> teks oranye bold
+ROW_TEXT_RED = wx.Colour(200, 0, 0)
+ROW_TEXT_ORANGE = wx.Colour(230, 120, 0)
 
 # ---- warna list belang
 ROW_WHITE = wx.Colour(255, 255, 255)
@@ -72,6 +82,15 @@ def fmt_bps(bps):
             return f"{bps:.1f} {unit}"
         bps /= 1000
     return f"{bps:.1f} Tbps"
+
+
+def fmt_bytes(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
 
 
 def fmt_limit(v):
@@ -220,14 +239,21 @@ class _RowBox(wx.VListBox):
             return
         row = o.rows[n]
         widths = o.col_widths(rect.width)
-        dc.SetFont(self.GetFont())
+
+        # warna & bold teks satu baris (berdasarkan usage%)
+        color, bold = o.row_style(row)
+        font = self.GetFont()
+        if bold:
+            font.SetWeight(wx.FONTWEIGHT_BOLD)
+        dc.SetFont(font)
+
         x = rect.x
         for (title, _w, _m, kind), cw, val in zip(o.columns, widths, row):
             cell = wx.Rect(x + 6, rect.y, max(cw - 10, 1), rect.height)
             if kind == "bar":
                 self._draw_bar(dc, cell, val)
             else:
-                dc.SetTextForeground(wx.BLACK)
+                dc.SetTextForeground(color)
                 text = str(val)
                 tw, th = dc.GetTextExtent(text)
                 dc.SetClippingRegion(cell)
@@ -259,15 +285,17 @@ class _RowBox(wx.VListBox):
 
 
 class StripedList(wx.Panel):
-    """Header + daftar belang. columns = [(judul, bobot_lebar, lebar_min, 'text'|'bar')]."""
+    """Header + daftar belang. columns = [(judul, bobot_lebar, lebar_min, 'text'|'bar')].
+    pct_index = posisi nilai usage% di dalam tuple baris (untuk warna teks baris)."""
 
     ROW_H = 24
     HEAD_H = 26
 
-    def __init__(self, parent, columns, on_activate=None):
+    def __init__(self, parent, columns, on_activate=None, pct_index=None):
         super().__init__(parent)
         self.columns = columns
         self.on_activate = on_activate
+        self.pct_index = pct_index
         self.rows = []
         self.selected = None
 
@@ -292,6 +320,17 @@ class StripedList(wx.Panel):
         wsum = sum(c[1] for c in self.columns)
         extra = max(total - sum(mins), 0)
         return [int(m + extra * c[1] / wsum) for m, c in zip(mins, self.columns)]
+
+    def row_style(self, row):
+        """-> (warna_teks, bold) untuk satu baris."""
+        if self.pct_index is not None and self.pct_index < len(row):
+            pct = row[self.pct_index]
+            if pct is not None:
+                if pct >= ROW_RED_PCT:
+                    return ROW_TEXT_RED, True
+                if pct >= ROW_ORANGE_PCT:
+                    return ROW_TEXT_ORANGE, True
+        return wx.BLACK, False
 
     def set_rows(self, rows):
         if rows == self.rows:
@@ -338,8 +377,8 @@ class StripedList(wx.Panel):
 
 # ---------------------------------------------------------------- grafik bandwidth
 class BwGraph(wx.Panel):
-    """Grafik batang vertikal tipis & rapat (ala Winbox). 1 batang = 1 detik.
-    Jarak antar batang TETAP (SLOT_PX); jendela lebar = lebih banyak detik terlihat,
+    """Grafik batang vertikal tipis & rapat (ala Winbox). 1 batang = 1 sampel data.
+    Jarak antar batang TETAP (SLOT_PX); jendela lebar = lebih banyak titik terlihat,
     bukan batang yang merenggang."""
 
     def __init__(self, parent, title, color):
@@ -403,7 +442,7 @@ class BwGraph(wx.Panel):
         # judul + nilai terakhir + info
         cur = vis[-1] if vis else 0
         dc.SetFont(small)
-        info = f"maks {fmt_bps(peak)}  |  {len(vis)} dtk"
+        info = f"maks {fmt_bps(peak)}  |  {len(vis)} titik"
         tw, th = dc.GetTextExtent(info)
         dc.SetTextForeground(wx.Colour(110, 110, 110))
         dc.DrawText(info, left + pw - tw, 6)
@@ -432,15 +471,20 @@ class BandwidthGraphFrame(wx.Frame):
 
 
 # ---------------------------------------------------------------- dashboard
+# Urutan kolom = urutan nilai di tuple baris (lihat render_queue)
 QUEUE_COLS = [
     ("Queue", 2.0, 110, "text"),
     ("Target", 2.0, 100, "text"),
-    ("Max Limit (Up / Down)", 2.6, 190, "text"),
-    ("TX (Download)", 1.3, 100, "text"),
-    ("RX (Upload)", 1.3, 100, "text"),
-    ("Total", 1.3, 100, "text"),
-    ("Usage", 2.4, 140, "bar"),
+    ("Max Limit (Up / Down)", 2.6, 170, "text"),
+    ("TX (Download)", 1.3, 90, "text"),
+    ("RX (Upload)", 1.3, 90, "text"),
+    ("Total", 1.3, 90, "text"),
+    ("Usage", 2.4, 130, "bar"),
+    ("Total Download", 1.5, 100, "text"),
+    ("Total Upload", 1.5, 100, "text"),
 ]
+QUEUE_PCT_INDEX = 6     # posisi kolom Usage di QUEUE_COLS
+
 IF_COLS = [
     ("Interface", 2.0, 120, "text"),
     ("Type", 1.2, 90, "text"),
@@ -454,14 +498,15 @@ class Dashboard(wx.Frame):
     SORT_CHOICES = ["NAMA", "TRAFIK TX", "TRAFIK RX", "TOTAL BANDWIDTH"]
 
     def __init__(self, api, host):
-        super().__init__(None, title=f"MikroTik Dashboard - {host}", size=(1020, 700))
+        super().__init__(None, title=f"MikroTik Dashboard - {host}", size=(1150, 700))
         self.api = api
         self.running = True
+        self.q_interval = DEFAULT_Q_INTERVAL   # detik, dibaca oleh thread polling
         self.prev = {}            # {interface: (waktu, rx_byte, tx_byte)}
         self.q_history = {}       # {queue: {"tx": deque, "rx": deque}}
         self.if_history = {}      # {interface: {"tx": deque, "rx": deque}}
         self.graphs = {}          # {(jenis, nama): BandwidthGraphFrame}
-        self.queue_rows = []      # (name, target, limit_text, tx, rx, pct)
+        self.queue_rows = []      # (name, target, limit_text, tx, rx, pct, total_down, total_up)
 
         root = wx.Panel(self)
 
@@ -501,10 +546,26 @@ class Dashboard(wx.Frame):
         self.sort_box = wx.RadioBox(q_panel, label="Sort by", choices=self.SORT_CHOICES,
                                     majorDimension=1, style=wx.RA_SPECIFY_ROWS)
         self.sort_box.Bind(wx.EVT_RADIOBOX, lambda e: self.render_queue())
+
+        # input refresh rate queue (detik)
+        self.spin_q = wx.SpinCtrl(q_panel, min=1, max=3600, initial=DEFAULT_Q_INTERVAL,
+                                  size=(70, -1))
+        self.spin_q.Bind(wx.EVT_SPINCTRL, self.on_q_interval)
+        self.spin_q.Bind(wx.EVT_TEXT, self.on_q_interval)
+
+        srow = wx.BoxSizer(wx.HORIZONTAL)
+        srow.Add(self.sort_box, 0, wx.RIGHT, 20)
+        srow.Add(wx.StaticText(q_panel, label="Refresh queue tiap"), 0,
+                 wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        srow.Add(self.spin_q, 0, wx.ALIGN_CENTER_VERTICAL)
+        srow.Add(wx.StaticText(q_panel, label="detik"), 0,
+                 wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 6)
+
         self.lst_q = StripedList(q_panel, QUEUE_COLS,
-                                 on_activate=lambda n: self.open_graph("queue", n))
+                                 on_activate=lambda n: self.open_graph("queue", n),
+                                 pct_index=QUEUE_PCT_INDEX)
         qbox = wx.BoxSizer(wx.VERTICAL)
-        qbox.Add(self.sort_box, 0, wx.EXPAND | wx.ALL, 4)
+        qbox.Add(srow, 0, wx.EXPAND | wx.ALL, 4)
         qbox.Add(self.lst_q, 1, wx.EXPAND)
         q_panel.SetSizer(qbox)
 
@@ -533,13 +594,16 @@ class Dashboard(wx.Frame):
         h = self.splitter.GetClientSize().height
         self.splitter.SetSashPosition(int(h * 0.7))   # queue 70% / interface 30%
 
+    def on_q_interval(self, _evt):
+        self.q_interval = max(1, self.spin_q.GetValue())
+
     # ------------------------------------------------ thread polling
     def poll(self):
+        last_q = 0.0
         while self.running:
             try:
                 res = list(self.api.path("system", "resource"))
                 ifaces = list(self.api.path("interface"))
-                queues = list(self.api.path("queue", "simple"))
                 now = time.time()
 
                 sysinfo = {}
@@ -571,17 +635,25 @@ class Dashboard(wx.Frame):
                                     "running" if it.get("running") else "down",
                                     rx_bps, tx_bps))
 
-                q_rows = []
-                for q in queues:
-                    # rate = "upload/download" dari sudut pandang client.
-                    # Sudut pandang router: TX = download ke client, RX = upload dari client.
-                    up, _, down = str(q.get("rate", "0/0")).partition("/")
-                    rx_bps, tx_bps = to_int(up), to_int(down)
-                    lim_up, lim_down = parse_limit(q.get("max-limit"))
-                    q_rows.append((q.get("name", ""), q.get("target", ""),
-                                   f"{fmt_limit(lim_up)} / {fmt_limit(lim_down)}",
-                                   tx_bps, rx_bps,
-                                   usage_pct(tx_bps, rx_bps, lim_up, lim_down)))
+                # queue: hanya diambil kalau sudah waktunya (None = tidak di-update)
+                q_rows = None
+                if now - last_q >= self.q_interval:
+                    queues = list(self.api.path("queue", "simple"))
+                    last_q = now
+                    q_rows = []
+                    for q in queues:
+                        # rate = "upload/download" dari sudut pandang client.
+                        # Sudut pandang router: TX = download ke client, RX = upload dari client.
+                        up, _, down = str(q.get("rate", "0/0")).partition("/")
+                        rx_bps, tx_bps = to_int(up), to_int(down)
+                        lim_up, lim_down = parse_limit(q.get("max-limit"))
+                        # bytes = "upload/download" (kumulatif, sudut pandang client)
+                        b_up, _, b_down = str(q.get("bytes", "0/0")).partition("/")
+                        q_rows.append((q.get("name", ""), q.get("target", ""),
+                                       f"{fmt_limit(lim_up)} / {fmt_limit(lim_down)}",
+                                       tx_bps, rx_bps,
+                                       usage_pct(tx_bps, rx_bps, lim_up, lim_down),
+                                       to_int(b_down), to_int(b_up)))
 
                 wx.CallAfter(self.update_ui, sysinfo, if_rows, q_rows)
             except Exception as e:
@@ -610,18 +682,21 @@ class Dashboard(wx.Frame):
         # ---- interface
         for name, _t, _s, rx, tx in if_rows:
             self._push(self.if_history, name, tx, rx)
-        for gone in [n for n in self.if_history if n not in {r[0] for r in if_rows}]:
+        if_names = {r[0] for r in if_rows}
+        for gone in [n for n in self.if_history if n not in if_names]:
             del self.if_history[gone]
         self.lst_if.set_rows([(n, t, s, fmt_bps(rx), fmt_bps(tx))
                               for n, t, s, rx, tx in if_rows])
 
-        # ---- queue
-        for name, _t, _l, tx, rx, _p in q_rows:
-            self._push(self.q_history, name, tx, rx)
-        for gone in [n for n in self.q_history if n not in {r[0] for r in q_rows}]:
-            del self.q_history[gone]
-        self.queue_rows = q_rows
-        self.render_queue()
+        # ---- queue (hanya kalau ada data baru sesuai interval)
+        if q_rows is not None:
+            for r in q_rows:
+                self._push(self.q_history, r[0], r[3], r[4])
+            q_names = {r[0] for r in q_rows}
+            for gone in [n for n in self.q_history if n not in q_names]:
+                del self.q_history[gone]
+            self.queue_rows = q_rows
+            self.render_queue()
 
         # ---- grafik yang sedang terbuka
         for (kind, name), win in self.graphs.items():
@@ -629,7 +704,9 @@ class Dashboard(wx.Frame):
             if h:
                 win.refresh_data(h["tx"], h["rx"])
 
-        self.SetStatusText(f"Update: {time.strftime('%H:%M:%S')}  |  Double-click queue / interface untuk grafik")
+        self.SetStatusText(f"Update: {time.strftime('%H:%M:%S')}  |  "
+                           f"Queue refresh tiap {self.q_interval} dtk  |  "
+                           f"Double-click queue / interface untuk grafik")
 
     def render_queue(self):
         mode = self.sort_box.GetSelection()
@@ -643,8 +720,12 @@ class Dashboard(wx.Frame):
         else:              # TOTAL BANDWIDTH
             rows.sort(key=lambda r: r[3] + r[4], reverse=True)
 
-        self.lst_q.set_rows([(n, t, lim, fmt_bps(tx), fmt_bps(rx), fmt_bps(tx + rx), pct)
-                             for n, t, lim, tx, rx, pct in rows])
+        # urutan harus sama dengan QUEUE_COLS
+        self.lst_q.set_rows([
+            (n, t, lim, fmt_bps(tx), fmt_bps(rx), fmt_bps(tx + rx), pct,
+             fmt_bytes(tdown), fmt_bytes(tup))
+            for n, t, lim, tx, rx, pct, tdown, tup in rows
+        ])
 
     # ------------------------------------------------ double-click -> grafik
     def _history(self, kind):
