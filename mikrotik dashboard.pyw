@@ -7,14 +7,19 @@ Install:
 Alur:
     1. Dialog Login : host, username, password, [x] Ingat saya
     2. Dialog Port  : port API (default 8728) -> baru konek
-    3. Dashboard    : info device + tombol KELUAR
-                      Queue (atas 70%) | Interface (bawah 30%), sash bisa digeser
-                      - Queue    : sort, bar usage (hijau/oranye/merah), double-click = grafik
-                                   kolom Total Download / Total Upload (di kanan Usage)
-                                   refresh rate queue bisa diatur (default 5 detik)
-                                   teks baris: >=100% merah bold, >=70% oranye bold, selain itu hitam
-                      - Interface: double-click = grafik
-                      - List belang abu-abu tipis & putih
+    3. Dashboard    : info device + tombol [USERNAME KELUAR]
+        Baris 1 : Sort by (+ input refresh queue)
+        Baris 2 : List Queue     (atas 70%)  - sort, bar usage, double-click = grafik
+        Baris 3 : List Interface (bawah 30%) - status JALAN (ijo) / MATI (merah),
+                                               Total Download (biru), Total Upload (ijo)
+        Baris 4 : Interface WAN (hanya grafik)
+                  - ether [ N ]      : nomor ether yang dipantau (ether1 dst)
+                  - tombol ON / OFF  : OFF = grafik hilang, tombol tetap ada
+                  - refresh [ N ] detik, tinggi grafik [ N ] px
+                  - garis vertikal abu-abu tipis tiap 30 detik
+                  - internet mati / link putus -> RX & TX merah NAIK FULL
+
+    Teks baris queue: >=100% merah bold, >=70% oranye bold, selain itu hitam biasa.
 """
 import json
 import math
@@ -37,7 +42,7 @@ APP_NAME = "MikroTikDash"
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".mikrotik_dash.json")
 
 # ---- pengaturan grafik
-HISTORY_MAX = 900      # riwayat disimpan (titik) -> 15 menit kalau 1 titik = 1 detik
+HISTORY_MAX = 900      # riwayat disimpan (titik)
 BAR_PX = 2             # lebar 1 batang (px)
 SLOT_PX = 3            # jarak antar batang (px); rapat & TETAP walau di-maximize
 
@@ -52,10 +57,29 @@ ROW_ORANGE_PCT = 70          # >= 70%  -> teks oranye bold
 ROW_TEXT_RED = wx.Colour(200, 0, 0)
 ROW_TEXT_ORANGE = wx.Colour(230, 120, 0)
 
+# ---- warna teks list interface
+COLOR_UP = wx.Colour(0, 150, 50)       # JALAN  (ijo)
+COLOR_DOWN = wx.Colour(210, 30, 30)    # MATI   (merah)
+COLOR_DL = wx.Colour(30, 90, 220)      # Total Download (biru)
+COLOR_UL = wx.Colour(20, 150, 60)      # Total Upload   (ijo)
+
+# ---- Interface WAN
+WAN_DEFAULT_ON = False       # True = langsung ON saat aplikasi dibuka
+WAN_DEFAULT_ETHER = 1        # ether1
+DEFAULT_WAN_INTERVAL = 5     # detik
+DEFAULT_WAN_HEIGHT = 120     # px (tinggi grafik)
+WAN_VGRID_SEC = 30           # garis vertikal tiap 30 detik
+WAN_PING_ENABLE = True       # cek internet lewat ping dari router
+WAN_PING_HOST = "8.8.8.8"    # tujuan ping untuk cek internet
+WAN_DOWN_COLOR = wx.Colour(225, 40, 40)
+VGRID_COLOR = wx.Colour(205, 205, 205)
+
 # ---- warna list belang
 ROW_WHITE = wx.Colour(255, 255, 255)
 ROW_GREY = wx.Colour(240, 242, 245)
 ROW_SELECTED = wx.Colour(190, 215, 245)
+
+BAR_BG = wx.Colour(235, 238, 242)
 
 
 # ---------------------------------------------------------------- helper
@@ -153,6 +177,21 @@ def nice_max(v):
     return 10 * exp
 
 
+def find_wan_iface(ifaces, num):
+    """Cari interface 'ether<num>'. Kalau tidak ada yang persis sama,
+    ambil yang diawali ether<num> (mis. 'ether1-WAN'), tanpa nyasar ke ether10."""
+    exact = f"ether{num}"
+    pat = re.compile(rf"^ether{num}(?!\d)", re.I)
+    first = None
+    for it in ifaces:
+        name = it.get("name", "")
+        if name == exact:
+            return it
+        if first is None and pat.match(name):
+            first = it
+    return first
+
+
 # ---------------------------------------------------------------- dialogs
 class LoginDialog(wx.Dialog):
     def __init__(self, parent, cfg):
@@ -248,12 +287,17 @@ class _RowBox(wx.VListBox):
         dc.SetFont(font)
 
         x = rect.x
-        for (title, _w, _m, kind), cw, val in zip(o.columns, widths, row):
+        for ci, ((title, _w, _m, kind), cw, val) in enumerate(zip(o.columns, widths, row)):
             cell = wx.Rect(x + 6, rect.y, max(cw - 10, 1), rect.height)
             if kind == "bar":
                 self._draw_bar(dc, cell, val)
             else:
-                dc.SetTextForeground(color)
+                cc = color
+                if o.cell_style:
+                    custom = o.cell_style(row, ci)     # warna khusus per-sel (opsional)
+                    if custom is not None:
+                        cc = custom
+                dc.SetTextForeground(cc)
                 text = str(val)
                 tw, th = dc.GetTextExtent(text)
                 dc.SetClippingRegion(cell)
@@ -286,16 +330,18 @@ class _RowBox(wx.VListBox):
 
 class StripedList(wx.Panel):
     """Header + daftar belang. columns = [(judul, bobot_lebar, lebar_min, 'text'|'bar')].
-    pct_index = posisi nilai usage% di dalam tuple baris (untuk warna teks baris)."""
+    pct_index  = posisi nilai usage% di dalam tuple baris (untuk warna teks baris).
+    cell_style = fungsi (row, index_kolom) -> wx.Colour / None (warna teks per-sel)."""
 
     ROW_H = 24
     HEAD_H = 26
 
-    def __init__(self, parent, columns, on_activate=None, pct_index=None):
+    def __init__(self, parent, columns, on_activate=None, pct_index=None, cell_style=None):
         super().__init__(parent)
         self.columns = columns
         self.on_activate = on_activate
         self.pct_index = pct_index
+        self.cell_style = cell_style
         self.rows = []
         self.selected = None
 
@@ -379,14 +425,20 @@ class StripedList(wx.Panel):
 class BwGraph(wx.Panel):
     """Grafik batang vertikal tipis & rapat (ala Winbox). 1 batang = 1 sampel data.
     Jarak antar batang TETAP (SLOT_PX); jendela lebar = lebih banyak titik terlihat,
-    bukan batang yang merenggang."""
+    bukan batang yang merenggang.
 
-    def __init__(self, parent, title, color):
+    - Nilai None dalam data = 'internet mati': batang merah setinggi penuh.
+    - vgrid_sec (opsional): garis vertikal abu-abu tipis tiap N detik
+      (butuh `times` = timestamp tiap sampel, lihat set_data)."""
+
+    def __init__(self, parent, title, color, vgrid_sec=None):
         super().__init__(parent, style=wx.BORDER_SIMPLE)
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
         self.title = title
         self.color = color
+        self.vgrid_sec = vgrid_sec
         self.data = []
+        self.times = None
         self.Bind(wx.EVT_PAINT, self.on_paint)
         self.Bind(wx.EVT_SIZE, self.on_size)
 
@@ -394,8 +446,9 @@ class BwGraph(wx.Panel):
         self.Refresh()
         evt.Skip()
 
-    def set_data(self, data):
+    def set_data(self, data, times=None):
         self.data = list(data)
+        self.times = list(times) if times is not None else None
         self.Refresh()
 
     def on_paint(self, _evt):
@@ -410,7 +463,9 @@ class BwGraph(wx.Panel):
 
         max_n = max(pw // SLOT_PX, 1)
         vis = self.data[-max_n:]                 # hanya yang muat di lebar saat ini
-        peak = max(vis, default=0)
+        vts = self.times[-max_n:] if self.times is not None else None
+        nums = [v for v in vis if v is not None]
+        peak = max(nums, default=0)
         vmax = nice_max(peak)
 
         small = self.GetFont()
@@ -427,16 +482,31 @@ class BwGraph(wx.Panel):
             tw, th = dc.GetTextExtent(label)
             dc.DrawText(label, left - tw - 6, y - th // 2)
 
-        # batang rapat, data terbaru di tepi kanan
         base = top + ph
         x0 = left + pw - len(vis) * SLOT_PX
+
+        # garis vertikal tipis abu-abu tiap vgrid_sec detik (mengikuti jam, ikut bergeser)
+        if self.vgrid_sec and vts and len(vts) == len(vis):
+            dc.SetPen(wx.Pen(VGRID_COLOR, 1))
+            for i in range(1, len(vis)):
+                if int(vts[i] // self.vgrid_sec) != int(vts[i - 1] // self.vgrid_sec):
+                    gx = x0 + i * SLOT_PX
+                    dc.DrawLine(gx, top, gx, base)
+
+        # batang rapat, data terbaru di tepi kanan
         dc.SetPen(wx.TRANSPARENT_PEN)
-        dc.SetBrush(wx.Brush(self.color))
+        normal_brush = wx.Brush(self.color)
+        down_brush = wx.Brush(WAN_DOWN_COLOR)
         for i, v in enumerate(vis):
+            if v is None:                         # internet mati -> merah FULL
+                dc.SetBrush(down_brush)
+                dc.DrawRectangle(x0 + i * SLOT_PX, top, BAR_PX, ph)
+                continue
             bar = int(ph * v / vmax)
             if v > 0:
                 bar = max(bar, 1)
             if bar:
+                dc.SetBrush(normal_brush)
                 dc.DrawRectangle(x0 + i * SLOT_PX, base - bar, BAR_PX, bar)
 
         # judul + nilai terakhir + info
@@ -450,8 +520,12 @@ class BwGraph(wx.Panel):
         bold = self.GetFont()
         bold.SetWeight(wx.FONTWEIGHT_BOLD)
         dc.SetFont(bold)
-        dc.SetTextForeground(self.color)
-        dc.DrawText(f"{self.title}: {fmt_bps(cur)}", left, 4)
+        if cur is None:
+            dc.SetTextForeground(WAN_DOWN_COLOR)
+            dc.DrawText(f"{self.title}: MATI", left, 4)
+        else:
+            dc.SetTextForeground(self.color)
+            dc.DrawText(f"{self.title}: {fmt_bps(cur)}", left, 4)
 
 
 class BandwidthGraphFrame(wx.Frame):
@@ -485,21 +559,36 @@ QUEUE_COLS = [
 ]
 QUEUE_PCT_INDEX = 6     # posisi kolom Usage di QUEUE_COLS
 
+# Urutan kolom = urutan nilai di tuple baris (lihat update_ui)
 IF_COLS = [
     ("Interface", 2.0, 120, "text"),
     ("Type", 1.2, 90, "text"),
     ("Status", 1.0, 80, "text"),
-    ("RX", 1.5, 110, "text"),
-    ("TX", 1.5, 110, "text"),
+    ("RX", 1.5, 100, "text"),
+    ("TX", 1.5, 100, "text"),
+    ("Total Download", 1.6, 110, "text"),
+    ("Total Upload", 1.6, 110, "text"),
 ]
+
+
+def if_cell_color(row, ci):
+    """Warna teks per-sel di list interface."""
+    if ci == 2:                                   # Status
+        return COLOR_UP if row[2] == "JALAN" else COLOR_DOWN
+    if ci == 5:                                   # Total Download
+        return COLOR_DL
+    if ci == 6:                                   # Total Upload
+        return COLOR_UL
+    return None
 
 
 class Dashboard(wx.Frame):
     SORT_CHOICES = ["NAMA", "TRAFIK TX", "TRAFIK RX", "TOTAL BANDWIDTH"]
 
-    def __init__(self, api, host):
-        super().__init__(None, title=f"MikroTik Dashboard - {host}", size=(1150, 700))
+    def __init__(self, api, host, user):
+        super().__init__(None, title=f"MikroTik Dashboard - {host}", size=(1150, 780))
         self.api = api
+        self.user = user
         self.running = True
         self.q_interval = DEFAULT_Q_INTERVAL   # detik, dibaca oleh thread polling
         self.prev = {}            # {interface: (waktu, rx_byte, tx_byte)}
@@ -508,11 +597,20 @@ class Dashboard(wx.Frame):
         self.graphs = {}          # {(jenis, nama): BandwidthGraphFrame}
         self.queue_rows = []      # (name, target, limit_text, tx, rx, pct, total_down, total_up)
 
-        root = wx.Panel(self)
+        # ---- state Interface WAN (dibaca juga oleh thread polling)
+        self.wan_on = WAN_DEFAULT_ON
+        self.wan_num = WAN_DEFAULT_ETHER
+        self.wan_interval = DEFAULT_WAN_INTERVAL
+        self.wan_gen = 0          # naik tiap ON/OFF atau ganti ether -> poll reset hitungan
+        self.wan_rx = deque(maxlen=HISTORY_MAX)   # download (RX di router); None = mati
+        self.wan_tx = deque(maxlen=HISTORY_MAX)   # upload   (TX di router); None = mati
+        self.wan_ts = deque(maxlen=HISTORY_MAX)   # timestamp tiap sampel (untuk garis 30 dtk)
 
-        # ---------- bar atas: info device + tombol KELUAR
+        self.root = root = wx.Panel(self)
+
+        # ---------- bar atas: info device + tombol [USERNAME KELUAR]
         top = wx.Panel(root)
-        top.SetBackgroundColour(wx.Colour(235, 238, 242))
+        top.SetBackgroundColour(BAR_BG)
         bold = top.GetFont()
         bold.SetWeight(wx.FONTWEIGHT_BOLD)
         self.lbl_dev = wx.StaticText(top, label="Device : -")
@@ -522,7 +620,8 @@ class Dashboard(wx.Frame):
         for lb in (self.lbl_dev, self.lbl_ram, self.lbl_use, self.lbl_cpu):
             lb.SetFont(bold)
 
-        self.btn_exit = GenButton(top, label="KELUAR", size=(100, 34))
+        self.btn_exit = GenButton(top, label=f"{(user or 'USER').upper()} KELUAR", size=(-1, 34))
+        self.btn_exit.SetMinSize((130, 34))
         self.btn_exit.SetBackgroundColour(wx.Colour(200, 30, 30))
         self.btn_exit.SetForegroundColour(wx.WHITE)
         self.btn_exit.SetFont(bold)
@@ -571,7 +670,8 @@ class Dashboard(wx.Frame):
 
         if_panel = wx.Panel(self.splitter)
         self.lst_if = StripedList(if_panel, IF_COLS,
-                                  on_activate=lambda n: self.open_graph("interface", n))
+                                  on_activate=lambda n: self.open_graph("interface", n),
+                                  cell_style=if_cell_color)
         ibox = wx.BoxSizer(wx.VERTICAL)
         ibox.Add(wx.StaticText(if_panel, label=" Interface"), 0, wx.TOP | wx.BOTTOM, 4)
         ibox.Add(self.lst_if, 1, wx.EXPAND)
@@ -579,10 +679,81 @@ class Dashboard(wx.Frame):
 
         self.splitter.SplitHorizontally(q_panel, if_panel, 400)
 
+        # ---------- baris 4: Interface WAN (hanya grafik)
+        self.wan_panel = wx.Panel(root)
+        self.wan_panel.SetBackgroundColour(BAR_BG)
+
+        wctrl = wx.Panel(self.wan_panel)
+        wctrl.SetBackgroundColour(BAR_BG)
+
+        wtitle = wx.StaticText(wctrl, label="Interface WAN")
+        wtitle.SetFont(bold)
+
+        self.spin_wan_n = wx.SpinCtrl(wctrl, min=1, max=99, initial=WAN_DEFAULT_ETHER,
+                                      size=(60, -1))
+        self.spin_wan_n.Bind(wx.EVT_SPINCTRL, self.on_wan_ether)
+        self.spin_wan_n.Bind(wx.EVT_TEXT, self.on_wan_ether)
+
+        self.btn_wan = GenButton(wctrl, label="OFF", size=(70, 28))
+        self.btn_wan.SetFont(bold)
+        self.btn_wan.Bind(wx.EVT_BUTTON, self.on_wan_toggle)
+
+        self.spin_wan_i = wx.SpinCtrl(wctrl, min=1, max=3600, initial=DEFAULT_WAN_INTERVAL,
+                                      size=(70, -1))
+        self.spin_wan_i.Bind(wx.EVT_SPINCTRL, self.on_wan_interval)
+        self.spin_wan_i.Bind(wx.EVT_TEXT, self.on_wan_interval)
+
+        self.spin_wan_h = wx.SpinCtrl(wctrl, min=60, max=600, initial=DEFAULT_WAN_HEIGHT,
+                                      size=(70, -1))
+        self.spin_wan_h.Bind(wx.EVT_SPINCTRL, self.on_wan_height)
+        self.spin_wan_h.Bind(wx.EVT_TEXT, self.on_wan_height)
+
+        self.lbl_wan = wx.StaticText(wctrl, label="", size=(290, -1))
+
+        wrow = wx.BoxSizer(wx.HORIZONTAL)
+        wrow.Add(wtitle, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 18)
+        wrow.Add(wx.StaticText(wctrl, label="ether ["), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        wrow.Add(self.spin_wan_n, 0, wx.ALIGN_CENTER_VERTICAL)
+        wrow.Add(wx.StaticText(wctrl, label="] wan"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 4)
+        wrow.Add(self.btn_wan, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 14)
+        wrow.Add(wx.StaticText(wctrl, label="Refresh tiap"), 0,
+                 wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 18)
+        wrow.Add(self.spin_wan_i, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 6)
+        wrow.Add(wx.StaticText(wctrl, label="detik"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 6)
+        wrow.Add(wx.StaticText(wctrl, label="Tinggi grafik"), 0,
+                 wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 18)
+        wrow.Add(self.spin_wan_h, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 6)
+        wrow.Add(wx.StaticText(wctrl, label="px"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 6)
+        wrow.Add(self.lbl_wan, 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 18)
+        wcbox = wx.BoxSizer(wx.VERTICAL)
+        wcbox.Add(wrow, 0, wx.EXPAND | wx.ALL, 6)
+        wctrl.SetSizer(wcbox)
+
+        # panel grafik (disembunyikan saat OFF)
+        self.wan_gpanel = wx.Panel(self.wan_panel)
+        self.wan_gpanel.SetBackgroundColour(BAR_BG)
+        self.wan_dl = BwGraph(self.wan_gpanel, "RX (Download)", wx.Colour(30, 90, 220),
+                              vgrid_sec=WAN_VGRID_SEC)
+        self.wan_ul = BwGraph(self.wan_gpanel, "TX (Upload)", wx.Colour(20, 150, 60),
+                              vgrid_sec=WAN_VGRID_SEC)
+        gbox = wx.BoxSizer(wx.HORIZONTAL)
+        gbox.Add(self.wan_dl, 1, wx.EXPAND | wx.ALL, 6)
+        gbox.Add(self.wan_ul, 1, wx.EXPAND | wx.TOP | wx.RIGHT | wx.BOTTOM, 6)
+        self.wan_gpanel.SetSizer(gbox)
+
+        wbox = wx.BoxSizer(wx.VERTICAL)
+        wbox.Add(wctrl, 0, wx.EXPAND)
+        wbox.Add(self.wan_gpanel, 0, wx.EXPAND)
+        self.wan_panel.SetSizer(wbox)
+
         rbox = wx.BoxSizer(wx.VERTICAL)
         rbox.Add(top, 0, wx.EXPAND)
         rbox.Add(self.splitter, 1, wx.EXPAND)
+        rbox.Add(self.wan_panel, 0, wx.EXPAND)
         root.SetSizer(rbox)
+
+        self.style_wan_button()
+        self.update_wan_view()
 
         self.CreateStatusBar()
         self.Bind(wx.EVT_CLOSE, self.on_close)
@@ -597,9 +768,82 @@ class Dashboard(wx.Frame):
     def on_q_interval(self, _evt):
         self.q_interval = max(1, self.spin_q.GetValue())
 
+    # ------------------------------------------------ Interface WAN: kontrol
+    def style_wan_button(self):
+        if self.wan_on:
+            self.btn_wan.SetLabel("ON")
+            self.btn_wan.SetBackgroundColour(wx.Colour(40, 160, 70))
+        else:
+            self.btn_wan.SetLabel("OFF")
+            self.btn_wan.SetBackgroundColour(wx.Colour(150, 150, 150))
+        self.btn_wan.SetForegroundColour(wx.WHITE)
+        self.btn_wan.Refresh()
+
+    def set_wan_label(self, text, down=False):
+        self.lbl_wan.SetForegroundColour(WAN_DOWN_COLOR if down else wx.BLACK)
+        self.lbl_wan.SetLabel(text)
+        self.lbl_wan.Refresh()
+
+    def update_wan_view(self):
+        """Tampilkan/sembunyikan grafik WAN & atur tingginya."""
+        h = self.spin_wan_h.GetValue()
+        self.wan_gpanel.SetMinSize((-1, h + 12))
+        self.wan_gpanel.Show(self.wan_on)
+        self.wan_gpanel.InvalidateBestSize()
+        self.wan_panel.InvalidateBestSize()
+        self.root.Layout()
+        self.wan_panel.Layout()
+
+    def wan_clear(self):
+        self.wan_rx.clear()
+        self.wan_tx.clear()
+        self.wan_ts.clear()
+        self.wan_dl.set_data([], [])
+        self.wan_ul.set_data([], [])
+
+    def on_wan_toggle(self, _evt):
+        self.wan_on = not self.wan_on
+        self.wan_clear()
+        self.wan_gen += 1
+        self.style_wan_button()
+        self.set_wan_label(f"Menunggu data ether{self.wan_num}..." if self.wan_on else "")
+        self.update_wan_view()
+
+    def on_wan_ether(self, _evt):
+        n = self.spin_wan_n.GetValue()
+        if n == self.wan_num:
+            return
+        self.wan_num = n
+        self.wan_clear()
+        self.wan_gen += 1
+        if self.wan_on:
+            self.set_wan_label(f"Menunggu data ether{n}...")
+
+    def on_wan_interval(self, _evt):
+        self.wan_interval = max(1, self.spin_wan_i.GetValue())
+
+    def on_wan_height(self, _evt):
+        self.update_wan_view()
+
+    # ------------------------------------------------ cek internet (dipanggil dari thread polling)
+    def check_internet(self):
+        """True = internet nyambung, False = tidak konek, None = tidak bisa dicek.
+        Ping dilakukan oleh router (/ping) ke WAN_PING_HOST sebanyak 1x."""
+        if not WAN_PING_ENABLE:
+            return None
+        try:
+            rows = list(self.api("/ping", address=WAN_PING_HOST, count="1"))
+        except Exception:
+            return None
+        received = max((to_int(r.get("received")) for r in rows), default=0)
+        return received > 0
+
     # ------------------------------------------------ thread polling
     def poll(self):
         last_q = 0.0
+        last_wan = 0.0
+        wan_prev = None            # (waktu, rx_byte, tx_byte)
+        wan_gen_seen = self.wan_gen
         while self.running:
             try:
                 res = list(self.api.path("system", "resource"))
@@ -620,6 +864,7 @@ class Dashboard(wx.Frame):
                         "cpu": to_int(r.get("cpu-load")),
                     }
 
+                # (nama, type, status, rx_bps, tx_bps, rx_byte_total, tx_byte_total)
                 if_rows = []
                 for it in ifaces:
                     name = it.get("name", "")
@@ -633,7 +878,7 @@ class Dashboard(wx.Frame):
                     self.prev[name] = (now, rx, tx)
                     if_rows.append((name, it.get("type", ""),
                                     "running" if it.get("running") else "down",
-                                    rx_bps, tx_bps))
+                                    rx_bps, tx_bps, rx, tx))
 
                 # queue: hanya diambil kalau sudah waktunya (None = tidak di-update)
                 q_rows = None
@@ -655,7 +900,46 @@ class Dashboard(wx.Frame):
                                        usage_pct(tx_bps, rx_bps, lim_up, lim_down),
                                        to_int(b_down), to_int(b_up)))
 
-                wx.CallAfter(self.update_ui, sysinfo, if_rows, q_rows)
+                # Interface WAN: pakai data interface yang sudah diambil (tanpa request tambahan)
+                # wan_sample: None
+                #           | ("ok", nama, rx_bps, tx_bps)
+                #           | ("down", nama, alasan)      -> internet / link mati
+                #           | ("miss", nama_dicari)       -> interface tidak ketemu
+                wan_sample = None
+                if self.wan_on:
+                    if self.wan_gen != wan_gen_seen:
+                        wan_gen_seen = self.wan_gen
+                        wan_prev = None
+                    if wan_prev is None or now - last_wan >= self.wan_interval:
+                        it = find_wan_iface(ifaces, self.wan_num)
+                        if it is None:
+                            wan_sample = ("miss", f"ether{self.wan_num}")
+                            wan_prev = None
+                        else:
+                            name = it.get("name", "")
+                            rx, tx = to_int(it.get("rx-byte")), to_int(it.get("tx-byte"))
+
+                            reason = None
+                            if not it.get("running"):
+                                reason = "link putus"
+                            elif self.check_internet() is False:
+                                reason = f"ping {WAN_PING_HOST} gagal"
+
+                            if reason:
+                                wan_sample = ("down", name, reason)
+                            elif wan_prev is not None:
+                                t0, rx0, tx0 = wan_prev
+                                dt = max(now - t0, 0.001)
+                                wan_sample = ("ok", name,
+                                              max(rx - rx0, 0) * 8 / dt,
+                                              max(tx - tx0, 0) * 8 / dt)
+                            wan_prev = (now, rx, tx)
+                            last_wan = now
+                else:
+                    wan_gen_seen = self.wan_gen
+                    wan_prev = None
+
+                wx.CallAfter(self.update_ui, sysinfo, if_rows, q_rows, wan_sample)
             except Exception as e:
                 wx.CallAfter(self.SetStatusText, f"Error: {e}")
             time.sleep(1)
@@ -668,7 +952,7 @@ class Dashboard(wx.Frame):
         h["tx"].append(tx)
         h["rx"].append(rx)
 
-    def update_ui(self, sysinfo, if_rows, q_rows):
+    def update_ui(self, sysinfo, if_rows, q_rows, wan_sample=None):
         if not self.running:
             return
 
@@ -680,13 +964,16 @@ class Dashboard(wx.Frame):
             self.lbl_dev.GetParent().Layout()
 
         # ---- interface
-        for name, _t, _s, rx, tx in if_rows:
+        for name, _t, _s, rx, tx, _rb, _tb in if_rows:
             self._push(self.if_history, name, tx, rx)
         if_names = {r[0] for r in if_rows}
         for gone in [n for n in self.if_history if n not in if_names]:
             del self.if_history[gone]
-        self.lst_if.set_rows([(n, t, s, fmt_bps(rx), fmt_bps(tx))
-                              for n, t, s, rx, tx in if_rows])
+        self.lst_if.set_rows([
+            (n, t, "JALAN" if s == "running" else "MATI",
+             fmt_bps(rx), fmt_bps(tx), fmt_bytes(rb), fmt_bytes(tb))
+            for n, t, s, rx, tx, rb, tb in if_rows
+        ])
 
         # ---- queue (hanya kalau ada data baru sesuai interval)
         if q_rows is not None:
@@ -697,6 +984,24 @@ class Dashboard(wx.Frame):
                 del self.q_history[gone]
             self.queue_rows = q_rows
             self.render_queue()
+
+        # ---- Interface WAN
+        if wan_sample is not None and self.wan_on:
+            kind = wan_sample[0]
+            if kind == "miss":
+                self.set_wan_label(f"{wan_sample[1]} tidak ditemukan", down=True)
+            else:
+                if kind == "ok":
+                    rx_v, tx_v = wan_sample[2], wan_sample[3]
+                    self.set_wan_label(f"Menampilkan: {wan_sample[1]}")
+                else:                                  # "down" -> merah FULL
+                    rx_v = tx_v = None
+                    self.set_wan_label(f"{wan_sample[1]} MATI - {wan_sample[2]}", down=True)
+                self.wan_rx.append(rx_v)
+                self.wan_tx.append(tx_v)
+                self.wan_ts.append(time.time())
+                self.wan_dl.set_data(self.wan_rx, self.wan_ts)
+                self.wan_ul.set_data(self.wan_tx, self.wan_ts)
 
         # ---- grafik yang sedang terbuka
         for (kind, name), win in self.graphs.items():
@@ -814,7 +1119,7 @@ def main():
                     pass
         save_config(data)
 
-        Dashboard(api, host).Show()
+        Dashboard(api, host, user).Show()
         break
 
     app.MainLoop()
