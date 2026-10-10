@@ -2,7 +2,8 @@
 """
 Auto List Pasien dari PDF
 Database : AutopasienPDF.db (SQLite, bisa dibuka pakai DBeaver)
-Library  : wxPython, pymupdf  -> pip install wxPython pymupdf
+Library  : wxPython, pymupdf, openpyxl
+           pip install wxPython pymupdf openpyxl
 """
 import json
 import os
@@ -11,6 +12,7 @@ import sqlite3
 import sys
 import threading
 import webbrowser
+from datetime import datetime
 
 import wx
 import wx.grid as gridlib
@@ -26,6 +28,12 @@ try:
     from pypdf import PdfReader
 except ImportError:
     PdfReader = None
+try:
+    import openpyxl
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+except ImportError:
+    openpyxl = None
 
 
 def get_app_dir():
@@ -489,6 +497,7 @@ class MainFrame(wx.Frame):
         self.sort_col = None   # index kolom yang sedang di-sort
         self.sort_asc = True
         self.search_timer = None
+        self.current_rows = []  # baris yang sedang tampil di list (dipakai export)
 
         # buka database terakhir yang dipilih (atau default di folder .exe)
         self.db_path = load_last_db()
@@ -563,11 +572,14 @@ class MainFrame(wx.Frame):
         self.btn_edit = wx.Button(p, label="UBAH DATA")
         self.btn_del = wx.Button(p, label="HAPUS")
         self.btn_ref = wx.Button(p, label="REFRESH")
+        self.btn_export = wx.Button(p, label="EXPORT TO EXCEL")
+        self.btn_export.SetBackgroundColour(wx.Colour(33, 115, 70))
+        self.btn_export.SetForegroundColour(wx.Colour(255, 255, 255))
         self.txt_search = wx.TextCtrl(p, size=(300, -1))
         self.txt_search.SetHint("Ketik untuk mencari (nama / no. peserta / SEP / telp...)")
         self.lbl_total = wx.StaticText(p, label="Total: 0")
 
-        for b in (self.btn_db, self.btn_edit, self.btn_del, self.btn_ref):
+        for b in (self.btn_db, self.btn_edit, self.btn_del, self.btn_ref, self.btn_export):
             bar.Add(b, 0, wx.RIGHT, 6)
         bar.AddStretchSpacer(1)
         bar.Add(self.lbl_total, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
@@ -601,6 +613,7 @@ class MainFrame(wx.Frame):
         self.btn_edit.Bind(wx.EVT_BUTTON, self.on_edit)
         self.btn_del.Bind(wx.EVT_BUTTON, self.on_delete)
         self.btn_ref.Bind(wx.EVT_BUTTON, lambda e: self.refresh_grid())
+        self.btn_export.Bind(wx.EVT_BUTTON, self.on_export_excel)
         self.txt_search.Bind(wx.EVT_TEXT, self.on_search_text)
         self.grid.Bind(gridlib.EVT_GRID_CELL_LEFT_CLICK, self.on_cell_click)
         self.grid.Bind(gridlib.EVT_GRID_CELL_LEFT_DCLICK, self.on_cell_dclick)
@@ -649,6 +662,7 @@ class MainFrame(wx.Frame):
         except Exception as ex:
             wx.MessageBox(f"Gagal membaca database:\n{ex}", "Error", wx.OK | wx.ICON_ERROR)
             return
+        self.current_rows = rows  # simpan baris yang tampil, dipakai untuk export
         g = self.grid
         g.BeginBatch()
         n = g.GetNumberRows()
@@ -707,6 +721,89 @@ class MainFrame(wx.Frame):
         elif digits.startswith("8"):
             digits = "62" + digits
         webbrowser.open(f"https://wa.me/{digits}")
+
+    # ---------------- export excel
+    def on_export_excel(self, _):
+        """Export data yang sedang tampil di list (sesuai pencarian & urutan)."""
+        if openpyxl is None:
+            wx.MessageBox(
+                "Library Excel belum terpasang.\n\nJalankan di CMD:\npip install openpyxl",
+                "Export to Excel", wx.OK | wx.ICON_WARNING,
+            )
+            return
+        rows = self.current_rows
+        if not rows:
+            wx.MessageBox("Tidak ada data untuk diexport.", "Export to Excel", wx.OK | wx.ICON_INFORMATION)
+            return
+
+        keyword = self.txt_search.GetValue().strip()
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"Data_Pasien_{'Hasil_Pencarian_' if keyword else ''}{stamp}.xlsx"
+
+        dlg = wx.FileDialog(
+            self, "Simpan sebagai Excel", defaultDir=BASE_DIR, defaultFile=default_name,
+            wildcard="Excel (*.xlsx)|*.xlsx", style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT,
+        )
+        if dlg.ShowModal() != wx.ID_OK:
+            dlg.Destroy()
+            return
+        path = dlg.GetPath()
+        dlg.Destroy()
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+
+        try:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Data Pasien"
+
+            # header
+            ws.append([label for _, label in COLS])
+            head_fill = PatternFill("solid", fgColor="2EB847")
+            for c in range(1, len(COLS) + 1):
+                cell = ws.cell(row=1, column=c)
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = head_fill
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+
+            # isi data (semua disimpan sebagai teks supaya angka 0 di depan tidak hilang)
+            for row in rows:
+                ws.append([str(row_get(row, key)) for key, _ in COLS])
+            for r in range(2, len(rows) + 2):
+                for c in range(1, len(COLS) + 1):
+                    ws.cell(row=r, column=c).number_format = "@"
+
+            # lebar kolom otomatis
+            for c, (key, label) in enumerate(COLS, 1):
+                longest = len(label)
+                for row in rows:
+                    longest = max(longest, len(str(row_get(row, key))))
+                ws.column_dimensions[get_column_letter(c)].width = min(longest + 3, 45)
+
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            wb.save(path)
+        except PermissionError:
+            wx.MessageBox(
+                "File tidak bisa disimpan. Kemungkinan file itu sedang terbuka di Excel.\n"
+                "Tutup dulu file-nya atau pakai nama lain.",
+                "Export to Excel", wx.OK | wx.ICON_ERROR,
+            )
+            return
+        except Exception as ex:
+            wx.MessageBox(f"Gagal export:\n{ex}", "Export to Excel", wx.OK | wx.ICON_ERROR)
+            return
+
+        self.progress.set(100, f"Export selesai: {len(rows)} data")
+        ask = wx.MessageBox(
+            f"Berhasil export {len(rows)} data ke:\n{path}\n\nBuka file sekarang?",
+            "Export to Excel", wx.YES_NO | wx.ICON_INFORMATION,
+        )
+        if ask == wx.YES:
+            try:
+                os.startfile(path)  # Windows
+            except Exception:
+                pass
 
     # ---------------- tombol
     def on_select_db(self, _):
