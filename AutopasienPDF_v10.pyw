@@ -4,9 +4,11 @@ Auto List Pasien dari PDF
 Database : AutopasienPDF.db (SQLite, bisa dibuka pakai DBeaver)
 Library  : wxPython, pymupdf  -> pip install wxPython pymupdf
 """
+import json
 import os
 import re
 import sqlite3
+import sys
 import threading
 import webbrowser
 
@@ -25,10 +27,19 @@ try:
 except ImportError:
     PdfReader = None
 
-APP_TITLE = "Auto List Pasien dari pdf Versi 9 | di buat oleh Samman Media"
+
+def get_app_dir():
+    """Folder aplikasi: folder .exe kalau sudah di-convert, folder script kalau jalan biasa."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+APP_TITLE = "Auto List Pasien dari pdf"
 DB_NAME = "AutopasienPDF.db"
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = get_app_dir()
 DEFAULT_DB = os.path.join(BASE_DIR, DB_NAME)
+CONFIG_FILE = os.path.join(BASE_DIR, "AutoListPasien.json")
 
 GENDERS = ["Laki-laki", "Perempuan"]
 
@@ -57,6 +68,28 @@ DATE_COLS = {"tanggal_lahir", "tgl_masuk", "tgl_keluar"}
 COLOR_WHITE = wx.Colour(255, 255, 255)
 COLOR_GREY = wx.Colour(232, 232, 232)
 COLOR_WA = wx.Colour(37, 211, 102)
+
+
+# ------------------------------------------------------ simpan pilihan database
+def load_last_db():
+    """Ambil database terakhir yang dipilih user (kalau file-nya masih ada)."""
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            path = json.load(f).get("db_path", "")
+        if path and os.path.isfile(path):
+            return path
+    except Exception:
+        pass
+    return DEFAULT_DB
+
+
+def save_last_db(path):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump({"db_path": path}, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------- PDF parsing
 FIELD_LABELS = {
@@ -305,6 +338,9 @@ class Database:
                 self.conn.execute(f"ALTER TABLE pasien ADD COLUMN {field} TEXT")
         self.conn.commit()
 
+    def count(self):
+        return self.conn.execute("SELECT COUNT(*) FROM pasien").fetchone()[0]
+
     def find_existing(self, d):
         """Kembalikan baris yang sama (atau None)."""
         if d.get("no_SEP"):
@@ -448,13 +484,24 @@ class EditDialog(wx.Dialog):
 class MainFrame(wx.Frame):
     def __init__(self):
         super().__init__(None, title=APP_TITLE, size=(1350, 720))
-        self.db_path = DEFAULT_DB
-        self.db = Database(self.db_path)
         self.cancel = False
         self.worker = None
         self.sort_col = None   # index kolom yang sedang di-sort
         self.sort_asc = True
         self.search_timer = None
+
+        # buka database terakhir yang dipilih (atau default di folder .exe)
+        self.db_path = load_last_db()
+        try:
+            self.db = Database(self.db_path)
+        except Exception as ex:
+            wx.MessageBox(
+                f"Gagal membuka database:\n{self.db_path}\n\n{ex}\n\nMemakai database default.",
+                "Error", wx.OK | wx.ICON_ERROR,
+            )
+            self.db_path = DEFAULT_DB
+            self.db = Database(self.db_path)
+        self.SetTitle(f"{APP_TITLE} - {self.db_path}")
 
         main = wx.BoxSizer(wx.HORIZONTAL)
         self.left = self.build_left()
@@ -597,7 +644,11 @@ class MainFrame(wx.Frame):
 
     # ---------------- grid
     def refresh_grid(self):
-        rows = self.sort_rows(self.db.fetch(self.txt_search.GetValue().strip()))
+        try:
+            rows = self.sort_rows(self.db.fetch(self.txt_search.GetValue().strip()))
+        except Exception as ex:
+            wx.MessageBox(f"Gagal membaca database:\n{ex}", "Error", wx.OK | wx.ICON_ERROR)
+            return
         g = self.grid
         g.BeginBatch()
         n = g.GetNumberRows()
@@ -659,24 +710,30 @@ class MainFrame(wx.Frame):
 
     # ---------------- tombol
     def on_select_db(self, _):
+        start_dir = os.path.dirname(self.db_path) if os.path.isdir(os.path.dirname(self.db_path)) else BASE_DIR
         dlg = wx.FileDialog(
-            self, "Pilih / buat database", defaultDir=os.path.dirname(self.db_path),
+            self, "Pilih / buat database", defaultDir=start_dir,
             defaultFile=os.path.basename(self.db_path),
             wildcard="SQLite DB (*.db)|*.db|Semua file (*.*)|*.*", style=wx.FD_SAVE,
         )
         if dlg.ShowModal() == wx.ID_OK:
             path = dlg.GetPath()
+            if not os.path.exists(path) and not os.path.splitext(path)[1]:
+                path += ".db"
             try:
                 new_db = Database(path)
+                total = new_db.count()  # tes baca tabel
             except Exception as ex:
-                wx.MessageBox(f"Gagal membuka database:\n{ex}", "Error", wx.OK | wx.ICON_ERROR)
+                wx.MessageBox(f"Gagal membuka database:\n{path}\n\n{ex}", "Error", wx.OK | wx.ICON_ERROR)
                 dlg.Destroy()
                 return
             self.db.close()
             self.db = new_db
             self.db_path = path
-            self.SetTitle(f"{APP_TITLE} - {os.path.basename(path)}")
+            save_last_db(path)  # diingat untuk pembukaan berikutnya
+            self.SetTitle(f"{APP_TITLE} - {path}")
             self.refresh_grid()
+            self.progress.set(0, f"Database dibuka: {total} data")
         dlg.Destroy()
 
     def edit_by_id(self, pid):
