@@ -1,0 +1,24 @@
+==== AUTO KLIK DETEKSI LAYAR V12 ====
+bre tambahin fitur lagi dong
+
+bagian Metode dropdown itu tambahin lagi 
+<SCREENSHOOT + KLIK KANAN>
+<SCREENSHOOT + KLIK GANDA>
+<SCREENSHOOT + DRAG>
+<TOMBOL>
+
+untuk SCREENSHOOT + DRAG itu otomatis nambahin dropdown
+Arah Drag <mouse ke atas full, mouse keatas setengah, mouse ke kanan full, mouse kanan setengah,
+mouse ke bawah full, mouse ke bawah setenah, mouse ke kiri full, mouse ke kiri setengah>
+
+untuk Form Kata Deteksi dan Form Teks yang diketik Jika menggunakan symbol
+[F10] artinya itu teken tombol F10, bilamana [CTRL+ALT+DELETE] artinya itu teken tombol CTRL ALT DELETE.
+
+selesai
+
+untuk fitur dropdown <TOMBOL> cara kerjanya 
+Kata Deteksi : <boleh kosong> boleh di isi
+Teks yang diketik : [9] maka teken tombol 9 dan itu harus pake kurung siku. dan bagian form teks yang di ketik 
+khususnya bagian form TOMBOL maka kasih placeholder Gunakan [Kurung siku]
+
+ini bre scriptnya. kalo bisa kasih full scriptnya bre... kalo gak paham jangan dulu kasih codingannya
