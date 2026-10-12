@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Auto List Pasien dari PDF  (v14) by samman media
+Auto List Pasien dari PDF  (v15)
 Database : AutopasienPDF.db (SQLite, bisa dibuka pakai DBeaver)
 Library  : wxPython, pymupdf, openpyxl, rapidocr-onnxruntime (OCR)
            pip install wxPython pymupdf openpyxl rapidocr-onnxruntime
@@ -69,13 +69,14 @@ def get_app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-APP_TITLE = "Auto List Pasien dari pdf v14"
+APP_TITLE = "Auto List Pasien dari pdf v15"
 DB_NAME = "AutopasienPDF.db"
 BASE_DIR = get_app_dir()
 DEFAULT_DB = os.path.join(BASE_DIR, DB_NAME)
 CONFIG_FILE = os.path.join(BASE_DIR, "AutoListPasien.json")
 
 GENDERS = ["Laki-laki", "Perempuan"]
+ROW_HEIGHT = 26  # tinggi baris tetap (tidak bisa ditarik)
 
 # ------------------------------------------------------------ struktur kolom
 # (nama kolom db, label, tipe SQL)
@@ -100,7 +101,7 @@ LABELS = {k: lab for k, lab, _ in FIELDS}
 LABELS["id"] = "ID"
 LABELS["wa"] = "WHATSAPP"
 
-# Urutan kolom di tabel layar (v14: DOKTER ditambah setelah TGL KELUAR)
+# Urutan kolom di tabel layar
 GRID_KEYS = [
     "id", "no_SEP", "no_peserta", "no_rekammedis", "jenis_kelamin",
     "tgl_masuk", "tgl_keluar", "dokter", "nama_peserta", "control_ulang",
@@ -233,8 +234,14 @@ CONTROL_LABEL_RE = re.compile(r"[KC][o0]ntr[o0][l1I|]\s*U[l1I|]ang", re.IGNORECA
 DATE_TEXT_RE = re.compile(r"(\d{1,2})\s*([A-Za-z]{3,10})\.?\s*,?\s*(20\d{2})")
 DATE_NUM_RE = re.compile(r"(\d{1,2})\s*[/\-.]\s*(\d{1,2})\s*[/\-.]\s*(20\d{2})")
 
-# "Nama Dokter : IRFAN FIRMANSYAH, Sp.U. dr" (toleran salah baca OCR pada kata Dokter)
-DOCTOR_RE = re.compile(r"Nama\s*Dok[a-z1|]{1,3}r\s*[:：;.]?\s*([^\n]*)", re.IGNORECASE)
+# "Dokter : Dr. Johan H, Sp.PD"  (halaman SURAT ELEGIBILITAS PESERTA / halaman 2)
+# Kata "Dokter" toleran salah baca OCR. Tanda ":" wajib ada supaya tidak
+# salah ambil kata "dokter" di dalam kalimat biasa.
+DOCTOR_RE = re.compile(r"(?<![A-Za-z])Dok[a-z1|]{1,3}r\s*[:：;]\s*([^\n]*)", re.IGNORECASE)
+LABEL_START_RE = re.compile(
+    r"(?i)^(nama|no|nomor|tanggal|tgl|poli|alamat|jenis|umur|diagnosa|kelas|"
+    r"peserta|faskes|kontrol|control|catatan)\b"
+)
 
 
 class PdfDoc:
@@ -391,23 +398,22 @@ def control_from_text(text):
 
 
 def doctor_from_text(text):
-    """Cari 'Nama Dokter : ...' (teks PDF atau hasil OCR)."""
-    m = DOCTOR_RE.search(text)
-    if not m:
-        return ""
-    val = m.group(1).strip()
-    if not val:
-        for line in text[m.end():].split("\n"):
-            line = line.strip()
-            if line:
-                if ":" not in line:
+    """Cari 'Dokter : Dr. Johan H, Sp.PD' -> 'Dr. Johan H, Sp.PD' (teks PDF atau hasil OCR)."""
+    for m in DOCTOR_RE.finditer(text):
+        val = m.group(1).strip()
+        if not val:
+            # nilai turun ke baris berikutnya
+            for line in text[m.end():].split("\n"):
+                line = line.strip()
+                if line:
                     val = line
-                break
-    val = re.split(r"\s{3,}|\t", val)[0].strip()
-    val = re.sub(r"\s+", " ", val)
-    if re.match(r"(?i)(nama|no|nomor|tanggal|tgl|poli|alamat)\b", val):
-        return ""
-    return val
+                    break
+        val = re.split(r"\s{3,}|\t", val)[0]
+        val = re.sub(r"\s+", " ", val).strip(" :;|_-")
+        if len(val) < 3 or ":" in val or LABEL_START_RE.match(val):
+            continue
+        return val
+    return ""
 
 
 def search_pages(pdf, parse, title_words, default_page):
@@ -455,9 +461,31 @@ def extract_control(pdf):
     )
 
 
-def extract_doctor(pdf):
-    """Dokter: halaman 'KWITANSI' / halaman 5."""
-    return search_pages(pdf, doctor_from_text, ["KWITANSI"], 4)
+def extract_doctor(pdf, allow_ocr=True):
+    """
+    Dokter: HANYA dari halaman 'SURAT ELEGIBILITAS PESERTA' / halaman ke-2.
+    1. baca teks PDF di halaman tsb
+    2. kalau tidak ketemu (misal halaman berupa gambar) -> OCR halaman tsb
+    """
+    pages = []
+    for i in range(pdf.count):
+        flat = re.sub(r"\s+", " ", pdf.text(i).upper())
+        if "ELEGIBILITAS" in flat or "ELIGIBILITAS" in flat:
+            pages.append(i)
+    if pdf.count >= 2 and 1 not in pages:
+        pages.append(1)
+
+    for i in pages:
+        val = doctor_from_text(pdf.text(i))
+        if val:
+            return val
+
+    if allow_ocr and OCR_AVAILABLE:
+        for i in pages:
+            val = doctor_from_text(pdf.ocr_text(i))
+            if val:
+                return val
+    return ""
 
 
 def extract_patient(path, db):
@@ -514,8 +542,9 @@ def extract_patient(path, db):
         if has_key:
             if need("control_ulang"):
                 data["control_ulang"] = extract_control(pdf)
-            if need("dokter"):
-                data["dokter"] = extract_doctor(pdf)
+            # Dokter selalu dibaca dari teks halaman 2 (cepat), supaya data lama yang
+            # salah bisa dikoreksi. OCR hanya dipakai kalau kolom dokter masih kosong.
+            data["dokter"] = extract_doctor(pdf, allow_ocr=need("dokter"))
         data["_ocr"] = pdf.ocr_used
         return data, existing
     finally:
@@ -904,6 +933,27 @@ class MainFrame(wx.Frame):
         self.grid.SetRowLabelSize(0)
         self.grid.EnableEditing(False)
         self.grid.SetSelectionMode(getattr(gridlib.Grid, "GridSelectRows", getattr(gridlib.Grid, "SelectRows", 1)))
+
+        # ---- tinggi baris dikunci: kursor tidak berubah jadi panah atas-bawah,
+        #      baris tidak bisa ditarik / di-resize (lebar kolom tetap bisa)
+        self.grid.SetDefaultRowSize(ROW_HEIGHT, True)
+        try:
+            self.grid.DisableDragRowSize()
+        except Exception:
+            pass
+        try:
+            self.grid.EnableDragRowSize(False)
+        except Exception:
+            pass
+        try:
+            self.grid.DisableDragGridSize()  # cadangan: matikan tarik ukuran di garis grid
+        except Exception:
+            pass
+        try:
+            self.grid.EnableDragColSize(True)  # lebar kolom tetap boleh diatur
+        except Exception:
+            pass
+
         self.update_header_labels()
 
         # kolom WHATSAPP: hijau, putih, tebal, rata tengah
@@ -938,6 +988,7 @@ class MainFrame(wx.Frame):
         self.grid.Bind(gridlib.EVT_GRID_CELL_LEFT_CLICK, self.on_cell_click)
         self.grid.Bind(gridlib.EVT_GRID_CELL_LEFT_DCLICK, self.on_cell_dclick)
         self.grid.Bind(gridlib.EVT_GRID_LABEL_LEFT_CLICK, self.on_header_click)
+        self.grid.Bind(gridlib.EVT_GRID_ROW_SIZE, lambda e: e.Veto())  # cadangan: tolak resize baris
 
         p.SetSizer(s)
         return p
@@ -1276,14 +1327,22 @@ class MainFrame(wx.Frame):
                             f"dokter: {data['dokter'] or '-'}{tag}"
                         )
                     else:
-                        # isi data yang masih kosong di database
+                        # isi data yang masih kosong di database.
+                        # khusus DOKTER: kalau beda dengan isi PDF halaman 2, ditimpa (koreksi data lama)
                         fields = {}
                         notes = []
                         for key, lab in fill_fields:
                             old = str(row_get(existing, key)).strip()
-                            if not old and data.get(key):
-                                fields[key] = data[key]
-                                notes.append(f"{lab}: {data[key]}")
+                            new = str(data.get(key) or "").strip()
+                            if not new:
+                                continue
+                            if key == "dokter":
+                                if new != old:
+                                    fields[key] = new
+                                    notes.append(f"{lab}: {new}")
+                            elif not old:
+                                fields[key] = new
+                                notes.append(f"{lab}: {new}")
                         if fields:
                             db.update_fields(existing["id"], fields)
                             upd += 1
