@@ -64,18 +64,29 @@ COLS = [
     ("tgl_masuk", "TGL MASUK"),
     ("tgl_keluar", "TGL KELUAR"),
     ("no_telepon", "NO TELEPON"),
+    ("control_ulang", "CONTROL ULANG"),
 ]
 DB_FIELDS = [c[0] for c in COLS if c[0] != "id"]
 PHONE_COL = 10
-WA_COL = 11
-COL_WIDTHS = [55, 230, 140, 120, 60, 100, 240, 120, 100, 100, 130, 110]
+WA_COL = 12
+COL_WIDTHS = [55, 230, 140, 120, 60, 100, 240, 120, 100, 100, 130, 150, 110]
 
 NUMERIC_COLS = {"id", "umur"}
-DATE_COLS = {"tanggal_lahir", "tgl_masuk", "tgl_keluar"}
+DATE_COLS = {"tanggal_lahir", "tgl_masuk", "tgl_keluar", "control_ulang"}
 
 COLOR_WHITE = wx.Colour(255, 255, 255)
 COLOR_GREY = wx.Colour(232, 232, 232)
 COLOR_WA = wx.Colour(37, 211, 102)
+
+MONTHS_ID = {
+    "januari": 1, "februari": 2, "maret": 3, "april": 4, "mei": 5, "juni": 6,
+    "juli": 7, "agustus": 8, "september": 9, "oktober": 10, "november": 11, "desember": 12,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "agu": 8, "agt": 8,
+    "ags": 8, "sep": 9, "okt": 10, "nov": 11, "des": 12,
+    # cadangan bahasa Inggris
+    "january": 1, "february": 2, "march": 3, "may": 5, "june": 6, "july": 7,
+    "august": 8, "october": 10, "december": 12, "aug": 8, "oct": 10, "dec": 12,
+}
 
 
 # ------------------------------------------------------ simpan pilihan database
@@ -119,6 +130,13 @@ PHONE_LABEL_RE = re.compile(
 )
 # cadangan: nomor HP berpola 08xxxxxxxxxx / 628xxxxxxxxxx / +628xxxxxxxxxx
 PHONE_LIKE_RE = re.compile(r"(?<![\d])((?:\+?62|0)8\d{8,12})(?![\d])")
+
+# "Control Ulang : 29 Agustus 2026"  (juga terima "Kontrol Ulang" & format 29/08/2026)
+CONTROL_RE = re.compile(
+    r"(?:Control|Kontrol)\s*Ulang\s*[:：]?\s*"
+    r"(\d{1,2}[ \t]+[A-Za-z]+[ \t]+\d{4}|\d{1,2}[/\-.]\d{1,2}[/\-.]\d{4})",
+    re.IGNORECASE,
+)
 
 
 class PdfDoc:
@@ -236,6 +254,40 @@ def extract_phone(pdf, exclude):
     return ""
 
 
+def control_from_text(text):
+    """Cari 'Control Ulang : 29 Agustus 2026' di satu halaman."""
+    m = CONTROL_RE.search(text)
+    if m:
+        return re.sub(r"\s+", " ", m.group(1)).strip()
+    return ""
+
+
+def extract_control(pdf):
+    """
+    Urutan pencarian Control Ulang:
+    1. halaman yang ada tulisan SURAT BUKTI PELAYANAN KESEHATAN / SBPK
+    2. halaman ke-3
+    3. semua halaman
+    """
+    order = []
+    for i in range(pdf.count):
+        t = pdf.text(i).upper()
+        t_flat = re.sub(r"\s+", " ", t)
+        if "SURAT BUKTI PELAYANAN KESEHATAN" in t_flat or "SBPK" in t_flat:
+            order.append(i)
+    if pdf.count >= 3 and 2 not in order:
+        order.append(2)
+    for i in range(pdf.count):
+        if i not in order:
+            order.append(i)
+
+    for i in order:
+        val = control_from_text(pdf.text(i))
+        if val:
+            return val
+    return ""
+
+
 def extract_patient(path):
     pdf = PdfDoc(path)
     try:
@@ -272,6 +324,9 @@ def extract_patient(path):
             if v:
                 exclude.add(v)
         data["no_telepon"] = extract_phone(pdf, exclude)
+
+        # Control Ulang: halaman "SURAT BUKTI PELAYANAN KESEHATAN (SBPK)" (halaman 3)
+        data["control_ulang"] = extract_control(pdf)
         return data
     finally:
         pdf.close()
@@ -288,6 +343,22 @@ def row_get(row, key):
     return ""
 
 
+def parse_date(text):
+    """Ubah '29/08/2026' atau '29 Agustus 2026' jadi (tahun, bulan, hari). Gagal -> None."""
+    text = (text or "").strip()
+    m = re.match(r"(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})", text)
+    if m:
+        d, mo, y = m.groups()
+        return (int(y), int(mo), int(d))
+    m = re.match(r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", text)
+    if m:
+        d, mon, y = m.groups()
+        mo = MONTHS_ID.get(mon.lower())
+        if mo:
+            return (int(y), mo, int(d))
+    return None
+
+
 def sort_key(col_key, value):
     """Kunci pengurutan: angka sebagai angka, tanggal sebagai tanggal, sisanya teks."""
     text = str(value).strip()
@@ -297,10 +368,9 @@ def sort_key(col_key, value):
         except ValueError:
             return (1, text.lower())
     if col_key in DATE_COLS:
-        m = re.match(r"(\d{1,2})/(\d{1,2})/(\d{4})", text)
-        if m:
-            d, mo, y = m.groups()
-            return (0, (int(y), int(mo), int(d)))
+        dt = parse_date(text)
+        if dt:
+            return (0, dt)
         return (1, text.lower())
     return (0, text.lower()) if text else (1, "")
 
@@ -326,7 +396,8 @@ class Database:
                 jenis_kelamin TEXT,
                 tgl_masuk TEXT,
                 tgl_keluar TEXT,
-                no_telepon TEXT
+                no_telepon TEXT,
+                control_ulang TEXT
             )"""
         )
         self.conn.commit()
@@ -341,6 +412,7 @@ class Database:
             cols.discard("nama_pasien")
             cols.add("nama_peserta")
 
+        # kolom baru (termasuk control_ulang) otomatis ditambah ke tabel lama
         for field in DB_FIELDS:
             if field.lower() not in cols:
                 self.conn.execute(f"ALTER TABLE pasien ADD COLUMN {field} TEXT")
@@ -364,6 +436,18 @@ class Database:
         self.conn.execute("UPDATE pasien SET no_telepon=? WHERE id=?", (phone, pid))
         self.conn.commit()
 
+    def update_fields(self, pid, fields):
+        """Update sebagian kolom saja (hanya kolom yang valid)."""
+        keys = [k for k in fields if k in DB_FIELDS]
+        if not keys:
+            return
+        sets = ",".join(f"{k}=?" for k in keys)
+        self.conn.execute(
+            f"UPDATE pasien SET {sets} WHERE id=?",
+            [fields[k] for k in keys] + [pid],
+        )
+        self.conn.commit()
+
     def insert(self, d):
         cols = ",".join(DB_FIELDS)
         qs = ",".join("?" * len(DB_FIELDS))
@@ -380,8 +464,9 @@ class Database:
                 """SELECT * FROM pasien WHERE nama_peserta LIKE ? OR no_peserta LIKE ?
                    OR no_rekammedis LIKE ? OR no_SEP LIKE ? OR no_telepon LIKE ?
                    OR tgl_masuk LIKE ? OR tgl_keluar LIKE ? OR tanggal_lahir LIKE ?
-                   OR jenis_kelamin LIKE ? OR umur LIKE ? ORDER BY id DESC""",
-                (like,) * 10,
+                   OR jenis_kelamin LIKE ? OR umur LIKE ? OR control_ulang LIKE ?
+                   ORDER BY id DESC""",
+                (like,) * 11,
             )
         else:
             cur = self.conn.execute("SELECT * FROM pasien ORDER BY id DESC")
@@ -907,13 +992,27 @@ class MainFrame(wx.Frame):
                     if existing is None:
                         db.insert(data)
                         baru += 1
-                        msg = f"[BARU ] {name} - {data['nama_peserta']} | telp: {data['no_telepon'] or '-'}"
+                        msg = (
+                            f"[BARU ] {name} - {data['nama_peserta']} | "
+                            f"telp: {data['no_telepon'] or '-'} | "
+                            f"control: {data['control_ulang'] or '-'}"
+                        )
                     else:
+                        # isi data yang masih kosong di database (telepon & control ulang)
                         old_phone = str(row_get(existing, "no_telepon")).strip()
+                        old_ctrl = str(row_get(existing, "control_ulang")).strip()
+                        fields = {}
+                        notes = []
                         if not old_phone and data["no_telepon"]:
-                            db.update_phone(existing["id"], data["no_telepon"])
+                            fields["no_telepon"] = data["no_telepon"]
+                            notes.append(f"telp: {data['no_telepon']}")
+                        if not old_ctrl and data["control_ulang"]:
+                            fields["control_ulang"] = data["control_ulang"]
+                            notes.append(f"control: {data['control_ulang']}")
+                        if fields:
+                            db.update_fields(existing["id"], fields)
                             upd += 1
-                            msg = f"[UPDATE] {name} - telp diisi: {data['no_telepon']}"
+                            msg = f"[UPDATE] {name} - diisi {', '.join(notes)}"
                         else:
                             dup += 1
                             msg = f"[SKIP ] {name} - sudah ada ({data['nama_peserta']})"
