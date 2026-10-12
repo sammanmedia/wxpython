@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Auto List Pasien dari PDF  (v14)
+Auto List Pasien dari PDF  (v14) by samman media
 Database : AutopasienPDF.db (SQLite, bisa dibuka pakai DBeaver)
 Library  : wxPython, pymupdf, openpyxl, rapidocr-onnxruntime (OCR)
            pip install wxPython pymupdf openpyxl rapidocr-onnxruntime
