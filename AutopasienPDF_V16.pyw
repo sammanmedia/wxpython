@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Auto List Pasien dari PDF  (v15)
+Auto List Pasien dari PDF  (v16)
 Database : AutopasienPDF.db (SQLite, bisa dibuka pakai DBeaver)
 Library  : wxPython, pymupdf, openpyxl, rapidocr-onnxruntime (OCR)
            pip install wxPython pymupdf openpyxl rapidocr-onnxruntime
@@ -15,6 +15,7 @@ import sys
 import threading
 import webbrowser
 from datetime import datetime
+from pathlib import Path
 
 import wx
 import wx.grid as gridlib
@@ -69,7 +70,7 @@ def get_app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-APP_TITLE = "Auto List Pasien dari pdf v15"
+APP_TITLE = "Auto List Pasien dari pdf v16"
 DB_NAME = "AutopasienPDF.db"
 BASE_DIR = get_app_dir()
 DEFAULT_DB = os.path.join(BASE_DIR, DB_NAME)
@@ -77,6 +78,7 @@ CONFIG_FILE = os.path.join(BASE_DIR, "AutoListPasien.json")
 
 GENDERS = ["Laki-laki", "Perempuan"]
 ROW_HEIGHT = 26  # tinggi baris tetap (tidak bisa ditarik)
+MAX_LOG_LIST = 300  # batas baris daftar konflik / data kosong yang ditulis ke log
 
 # ------------------------------------------------------------ struktur kolom
 # (nama kolom db, label, tipe SQL)
@@ -235,8 +237,6 @@ DATE_TEXT_RE = re.compile(r"(\d{1,2})\s*([A-Za-z]{3,10})\.?\s*,?\s*(20\d{2})")
 DATE_NUM_RE = re.compile(r"(\d{1,2})\s*[/\-.]\s*(\d{1,2})\s*[/\-.]\s*(20\d{2})")
 
 # "Dokter : Dr. Johan H, Sp.PD"  (halaman SURAT ELEGIBILITAS PESERTA / halaman 2)
-# Kata "Dokter" toleran salah baca OCR. Tanda ":" wajib ada supaya tidak
-# salah ambil kata "dokter" di dalam kalimat biasa.
 DOCTOR_RE = re.compile(r"(?<![A-Za-z])Dok[a-z1|]{1,3}r\s*[:：;]\s*([^\n]*)", re.IGNORECASE)
 LABEL_START_RE = re.compile(
     r"(?i)^(nama|no|nomor|tanggal|tgl|poli|alamat|jenis|umur|diagnosa|kelas|"
@@ -611,6 +611,11 @@ def default_for(key):
     return 0 if key == "ceklis" else ""
 
 
+def norm_name(text):
+    """Nama untuk perbandingan: huruf besar, spasi ganda dirapikan."""
+    return re.sub(r"\s+", " ", str(text or "")).strip().upper()
+
+
 # ------------------------------------------------------------------- Database
 def create_sql(table):
     cols = ",\n".join(f"{k} {t}" for k, _, t in FIELDS)
@@ -738,6 +743,122 @@ class Database:
     def delete(self, pid):
         self.conn.execute("DELETE FROM pasien WHERE id=?", (pid,))
         self.conn.commit()
+
+    # ---------------- gabung database (v16)
+    def backup_to(self, dest_path):
+        """Backup database ini ke file lain (memakai fitur backup resmi SQLite)."""
+        self.conn.commit()
+        dest = sqlite3.connect(dest_path)
+        try:
+            self.conn.backup(dest)
+        finally:
+            dest.close()
+
+    def merge_from(self, src_path):
+        """
+        Gabungkan data dari file .db lain ke database ini. File sumber hanya dibaca.
+        Aturan:
+        - NO SEP dan NAMA PESERTA wajib ada isinya, kalau tidak -> dilewati
+        - ID sumber tidak dipakai (ID baru dibuat otomatis)
+        - NO SEP baru -> baris baru
+        - NO SEP sama + nama sama -> data sama: tidak dobel, kolom kosong dilengkapi,
+          ceklis tetap SUDAH kalau salah satu sudah
+        - NO SEP sama + nama beda -> konflik: tidak digabung, dicatat
+        Return (stats, daftar_kosong, daftar_konflik)
+        """
+        stats = {"total": 0, "baru": 0, "lengkap": 0, "sama": 0, "kosong": 0, "konflik": 0}
+        kosong_list, konflik_list = [], []
+
+        uri = Path(src_path).resolve().as_uri() + "?mode=ro"
+        src = sqlite3.connect(uri, uri=True, timeout=30)
+        src.row_factory = sqlite3.Row
+        try:
+            has_tbl = src.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='pasien'"
+            ).fetchone()
+            if not has_tbl:
+                raise RuntimeError("Tabel 'pasien' tidak ditemukan di file ini.")
+            rows = src.execute("SELECT * FROM pasien ORDER BY id").fetchall()
+        finally:
+            src.close()
+
+        stats["total"] = len(rows)
+        try:
+            for r in rows:
+                sep = str(row_get(r, "no_SEP")).strip()
+                nama = str(row_get(r, "nama_peserta") or row_get(r, "nama_pasien")).strip()
+                src_id = row_get(r, "id")
+
+                if not sep or not nama:
+                    stats["kosong"] += 1
+                    kosong_list.append(
+                        f"ID {src_id}: NO SEP='{sep or '-'}' | nama='{nama or '-'}'"
+                    )
+                    continue
+
+                same_sep = self.conn.execute(
+                    "SELECT * FROM pasien WHERE no_SEP=?", (sep,)
+                ).fetchall()
+
+                if not same_sep:
+                    vals = []
+                    for k in DB_FIELDS:
+                        if k == "no_SEP":
+                            vals.append(sep)
+                        elif k == "nama_peserta":
+                            vals.append(nama)
+                        elif k == "ceklis":
+                            vals.append(1 if is_done(r) else 0)
+                        else:
+                            vals.append(str(row_get(r, k)).strip())
+                    self.conn.execute(
+                        f"INSERT INTO pasien ({','.join(DB_FIELDS)}) "
+                        f"VALUES ({','.join('?' * len(DB_FIELDS))})",
+                        vals,
+                    )
+                    stats["baru"] += 1
+                    continue
+
+                match = None
+                for x in same_sep:
+                    if norm_name(row_get(x, "nama_peserta")) == norm_name(nama):
+                        match = x
+                        break
+                if match is None:
+                    stats["konflik"] += 1
+                    konflik_list.append(
+                        f"NO SEP {sep}: sumber '{nama}' <> database ini "
+                        f"'{row_get(same_sep[0], 'nama_peserta')}'"
+                    )
+                    continue
+
+                # data sama: lengkapi kolom yang kosong saja
+                upd = {}
+                for k in DB_FIELDS:
+                    if k in ("no_SEP", "nama_peserta"):
+                        continue
+                    if k == "ceklis":
+                        if is_done(r) and not is_done(match):
+                            upd[k] = 1
+                        continue
+                    new = str(row_get(r, k)).strip()
+                    old = str(row_get(match, k)).strip()
+                    if new and not old:
+                        upd[k] = new
+                if upd:
+                    sets = ",".join(f"{k}=?" for k in upd)
+                    self.conn.execute(
+                        f"UPDATE pasien SET {sets} WHERE id=?",
+                        list(upd.values()) + [match["id"]],
+                    )
+                    stats["lengkap"] += 1
+                else:
+                    stats["sama"] += 1
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return stats, kosong_list, konflik_list
 
     def close(self):
         try:
@@ -909,6 +1030,9 @@ class MainFrame(wx.Frame):
 
         bar = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_db = wx.Button(p, label="SELEKSI DATABASE")
+        self.btn_merge = wx.Button(p, label="GABUNG DATABASE")
+        self.btn_merge.SetBackgroundColour(wx.Colour(0, 102, 204))
+        self.btn_merge.SetForegroundColour(wx.Colour(255, 255, 255))
         self.btn_edit = wx.Button(p, label="UBAH DATA")
         self.btn_del = wx.Button(p, label="HAPUS")
         self.btn_ref = wx.Button(p, label="REFRESH")
@@ -919,7 +1043,7 @@ class MainFrame(wx.Frame):
         self.txt_search.SetHint("Ketik untuk mencari (nama / no. peserta / SEP / telp / dokter...)")
         self.lbl_total = wx.StaticText(p, label="Total: 0")
 
-        for b in (self.btn_db, self.btn_edit, self.btn_del, self.btn_ref, self.btn_export):
+        for b in (self.btn_db, self.btn_merge, self.btn_edit, self.btn_del, self.btn_ref, self.btn_export):
             bar.Add(b, 0, wx.RIGHT, 6)
         bar.AddStretchSpacer(1)
         bar.Add(self.lbl_total, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
@@ -946,7 +1070,7 @@ class MainFrame(wx.Frame):
         except Exception:
             pass
         try:
-            self.grid.DisableDragGridSize()  # cadangan: matikan tarik ukuran di garis grid
+            self.grid.DisableDragGridSize()
         except Exception:
             pass
         try:
@@ -980,6 +1104,7 @@ class MainFrame(wx.Frame):
         s.Add(self.progress, 0, wx.ALL | wx.EXPAND, 8)
 
         self.btn_db.Bind(wx.EVT_BUTTON, self.on_select_db)
+        self.btn_merge.Bind(wx.EVT_BUTTON, self.on_merge_db)
         self.btn_edit.Bind(wx.EVT_BUTTON, self.on_edit)
         self.btn_del.Bind(wx.EVT_BUTTON, self.on_delete)
         self.btn_ref.Bind(wx.EVT_BUTTON, lambda e: self.refresh_grid())
@@ -1239,6 +1364,121 @@ class MainFrame(wx.Frame):
             self.progress.set(0, f"Database dibuka: {total} data")
         dlg.Destroy()
 
+    # ---------------- gabung database (v16)
+    def on_merge_db(self, _):
+        """Gabungkan satu atau banyak file .db ke database yang sedang dibuka."""
+        if self.worker and self.worker.is_alive():
+            wx.MessageBox("Tunggu proses scan folder selesai dulu.", "Gabung Database",
+                          wx.OK | wx.ICON_INFORMATION)
+            return
+
+        dlg = wx.FileDialog(
+            self, "Pilih file database yang mau digabung (boleh banyak)",
+            defaultDir=BASE_DIR,
+            wildcard="SQLite DB (*.db)|*.db|Semua file (*.*)|*.*",
+            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST | wx.FD_MULTIPLE,
+        )
+        if dlg.ShowModal() != wx.ID_OK:
+            dlg.Destroy()
+            return
+        paths = list(dlg.GetPaths())
+        dlg.Destroy()
+
+        master = os.path.normcase(os.path.abspath(self.db_path))
+        sources = []
+        for p in paths:
+            if os.path.normcase(os.path.abspath(p)) == master:
+                self.log.AppendText(f"[LEWAT] {os.path.basename(p)} - itu database yang sedang dibuka\n")
+            else:
+                sources.append(p)
+        if not sources:
+            wx.MessageBox("Tidak ada file yang bisa digabung.", "Gabung Database",
+                          wx.OK | wx.ICON_INFORMATION)
+            return
+
+        names = "\n".join("  - " + os.path.basename(p) for p in sources)
+        ask = wx.MessageBox(
+            f"Gabungkan {len(sources)} file ini ke:\n{self.db_path}\n\n{names}\n\n"
+            "Database ini akan di-backup otomatis dulu. File sumber tidak diubah.\n"
+            "Lanjut?",
+            "Gabung Database", wx.YES_NO | wx.ICON_QUESTION,
+        )
+        if ask != wx.YES:
+            return
+
+        # backup otomatis sebelum gabung
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        bak = f"{self.db_path}.bak_gabung_{stamp}"
+        try:
+            self.db.backup_to(bak)
+        except Exception as ex:
+            wx.MessageBox(f"Backup gagal, proses gabung dibatalkan:\n{ex}", "Gabung Database",
+                          wx.OK | wx.ICON_ERROR)
+            return
+
+        self.log.Clear()
+        self.log.AppendText(f"=== GABUNG DATABASE ===\nBackup: {os.path.basename(bak)}\n\n")
+
+        tot = {"total": 0, "baru": 0, "lengkap": 0, "sama": 0, "kosong": 0, "konflik": 0}
+        file_gagal = 0
+        wx.BeginBusyCursor()
+        try:
+            for n, p in enumerate(sources, 1):
+                name = os.path.basename(p)
+                self.progress.set((n - 1) * 100.0 / len(sources), f"Gabung {n}/{len(sources)}")
+                try:
+                    st, kosong_list, konflik_list = self.db.merge_from(p)
+                except Exception as ex:
+                    file_gagal += 1
+                    self.log.AppendText(f"[GAGAL] {name} - {ex}\n\n")
+                    continue
+                for k in tot:
+                    tot[k] += st[k]
+                self.log.AppendText(
+                    f"[OK] {name}\n"
+                    f"     isi file : {st['total']} data\n"
+                    f"     baru     : {st['baru']}\n"
+                    f"     dilengkapi: {st['lengkap']}\n"
+                    f"     sama     : {st['sama']}\n"
+                    f"     dilewati (NO SEP / nama kosong): {st['kosong']}\n"
+                    f"     konflik (NO SEP sama, nama beda): {st['konflik']}\n"
+                )
+                for line in kosong_list[:MAX_LOG_LIST]:
+                    self.log.AppendText(f"       [KOSONG ] {line}\n")
+                if len(kosong_list) > MAX_LOG_LIST:
+                    self.log.AppendText(f"       ... dan {len(kosong_list) - MAX_LOG_LIST} lainnya\n")
+                for line in konflik_list[:MAX_LOG_LIST]:
+                    self.log.AppendText(f"       [KONFLIK] {line}\n")
+                if len(konflik_list) > MAX_LOG_LIST:
+                    self.log.AppendText(f"       ... dan {len(konflik_list) - MAX_LOG_LIST} lainnya\n")
+                self.log.AppendText("\n")
+        finally:
+            wx.EndBusyCursor()
+
+        self.progress.set(100, "Gabung selesai")
+        self.lbl_stat.SetLabel(self.stat_text(tot["baru"], tot["lengkap"], tot["sama"], tot["konflik"] + tot["kosong"]))
+        self.log.AppendText(
+            "--- RINGKASAN ---\n"
+            f"Data baru masuk : {tot['baru']}\n"
+            f"Dilengkapi      : {tot['lengkap']}\n"
+            f"Sama (dilewati) : {tot['sama']}\n"
+            f"NO SEP/nama kosong: {tot['kosong']}\n"
+            f"Konflik         : {tot['konflik']}\n"
+            f"File gagal      : {file_gagal}\n"
+        )
+        self.refresh_grid()
+        wx.MessageBox(
+            f"Gabung selesai.\n\n"
+            f"Data baru masuk : {tot['baru']}\n"
+            f"Dilengkapi : {tot['lengkap']}\n"
+            f"Sama (tidak dobel) : {tot['sama']}\n"
+            f"Dilewati (NO SEP / nama kosong) : {tot['kosong']}\n"
+            f"Konflik (NO SEP sama, nama beda) : {tot['konflik']}\n"
+            f"File gagal : {file_gagal}\n\n"
+            "Detail ada di kotak log sebelah kiri.",
+            "Gabung Database", wx.OK | wx.ICON_INFORMATION,
+        )
+
     def edit_by_id(self, pid):
         row = self.db.get(pid)
         if not row:
@@ -1282,6 +1522,7 @@ class MainFrame(wx.Frame):
                 )
             self.cancel = False
             self.btn_folder.Disable()
+            self.btn_merge.Disable()
             self.btn_cancel.Enable()
             self.progress.set(0, "Memulai...")
             self.worker = threading.Thread(target=self.scan_worker, args=(folder,), daemon=True)
@@ -1374,6 +1615,7 @@ class MainFrame(wx.Frame):
             self.progress.set(self.progress.value, status)
         self.log.AppendText(f"--- {status} ---\n")
         self.btn_folder.Enable()
+        self.btn_merge.Enable()
         self.btn_cancel.Disable()
         self.refresh_grid()
 
