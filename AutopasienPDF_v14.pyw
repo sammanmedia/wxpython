@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Auto List Pasien dari PDF
+Auto List Pasien dari PDF  (v14)
 Database : AutopasienPDF.db (SQLite, bisa dibuka pakai DBeaver)
-Library  : wxPython, pymupdf, openpyxl
-           pip install wxPython pymupdf openpyxl
+Library  : wxPython, pymupdf, openpyxl, rapidocr-onnxruntime (OCR)
+           pip install wxPython pymupdf openpyxl rapidocr-onnxruntime
 """
+import difflib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
 import threading
@@ -35,6 +37,30 @@ try:
 except ImportError:
     openpyxl = None
 
+# ---- OCR (untuk halaman hasil scan gambar)
+try:
+    import numpy as np
+except Exception:
+    np = None
+try:
+    from rapidocr_onnxruntime import RapidOCR
+except Exception:
+    RapidOCR = None
+try:
+    import pytesseract  # cadangan, butuh program Tesseract terpasang
+    from PIL import Image
+    _tess = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    if os.path.isfile(_tess):
+        pytesseract.pytesseract.tesseract_cmd = _tess
+except Exception:
+    pytesseract = None
+    Image = None
+
+OCR_AVAILABLE = np is not None and (RapidOCR is not None or pytesseract is not None)
+OCR_DPI = 200
+OCR_LOCK = threading.Lock()
+_OCR = {"engine": None}
+
 
 def get_app_dir():
     """Folder aplikasi: folder .exe kalau sudah di-convert, folder script kalau jalan biasa."""
@@ -43,7 +69,7 @@ def get_app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-APP_TITLE = "Auto List Pasien dari pdf"
+APP_TITLE = "Auto List Pasien dari pdf v14"
 DB_NAME = "AutopasienPDF.db"
 BASE_DIR = get_app_dir()
 DEFAULT_DB = os.path.join(BASE_DIR, DB_NAME)
@@ -51,42 +77,81 @@ CONFIG_FILE = os.path.join(BASE_DIR, "AutoListPasien.json")
 
 GENDERS = ["Laki-laki", "Perempuan"]
 
-# (nama kolom db, label tampilan)
-COLS = [
-    ("id", "ID"),
-    ("nama_peserta", "NAMA PESERTA"),
-    ("no_peserta", "NO. PESERTA"),
-    ("no_rekammedis", "NO REKAM MEDIS"),
-    ("umur", "UMUR"),
-    ("tanggal_lahir", "TGL LAHIR"),
-    ("no_SEP", "NO SEP"),
-    ("jenis_kelamin", "JENIS KELAMIN"),
-    ("tgl_masuk", "TGL MASUK"),
-    ("tgl_keluar", "TGL KELUAR"),
-    ("no_telepon", "NO TELEPON"),
-    ("control_ulang", "CONTROL ULANG"),
+# ------------------------------------------------------------ struktur kolom
+# (nama kolom db, label, tipe SQL)
+FIELDS = [
+    ("no_SEP", "NO SEP", "TEXT"),
+    ("no_peserta", "NO. PESERTA", "TEXT"),
+    ("no_rekammedis", "NO REKAM MEDIS", "TEXT"),
+    ("jenis_kelamin", "JENIS KELAMIN", "TEXT"),
+    ("tgl_masuk", "TGL MASUK", "TEXT"),
+    ("tgl_keluar", "TGL KELUAR", "TEXT"),
+    ("nama_peserta", "NAMA PESERTA", "TEXT"),
+    ("control_ulang", "KONTROL ULANG", "TEXT"),
+    ("no_telepon", "NO TELEPON", "TEXT"),
+    ("dokter", "DOKTER", "TEXT"),
+    ("ceklis", "CEKLIS", "INTEGER DEFAULT 0"),  # 0 = belum, 1 = sudah
 ]
-DB_FIELDS = [c[0] for c in COLS if c[0] != "id"]
-PHONE_COL = 10
-WA_COL = 12
-COL_WIDTHS = [55, 230, 140, 120, 60, 100, 240, 120, 100, 100, 130, 150, 110]
+DB_FIELDS = [f[0] for f in FIELDS]
+SEARCH_FIELDS = [k for k in DB_FIELDS if k != "ceklis"]
+OBSOLETE_COLS = {"umur", "tanggal_lahir"}  # kolom lama yang dihapus
 
-NUMERIC_COLS = {"id", "umur"}
-DATE_COLS = {"tanggal_lahir", "tgl_masuk", "tgl_keluar", "control_ulang"}
+LABELS = {k: lab for k, lab, _ in FIELDS}
+LABELS["id"] = "ID"
+LABELS["wa"] = "WHATSAPP"
+
+# Urutan kolom di tabel layar (v14: DOKTER ditambah setelah TGL KELUAR)
+GRID_KEYS = [
+    "id", "no_SEP", "no_peserta", "no_rekammedis", "jenis_kelamin",
+    "tgl_masuk", "tgl_keluar", "dokter", "nama_peserta", "control_ulang",
+    "no_telepon", "wa", "ceklis",
+]
+GRID_COLS = [(k, LABELS[k]) for k in GRID_KEYS]
+PHONE_COL = GRID_KEYS.index("no_telepon")
+WA_COL = GRID_KEYS.index("wa")
+CEK_COL = GRID_KEYS.index("ceklis")
+
+COL_WIDTH = {
+    "id": 55, "no_SEP": 240, "no_peserta": 140, "no_rekammedis": 120,
+    "jenis_kelamin": 120, "tgl_masuk": 100, "tgl_keluar": 100,
+    "dokter": 260, "nama_peserta": 230, "control_ulang": 150,
+    "no_telepon": 130, "wa": 110, "ceklis": 110,
+}
+
+# Kolom untuk export Excel (sama dengan layar, tanpa WhatsApp)
+EXPORT_KEYS = [k for k in GRID_KEYS if k != "wa"]
+
+NUMERIC_COLS = {"id", "ceklis"}
+DATE_COLS = {"tgl_masuk", "tgl_keluar", "control_ulang"}
 
 COLOR_WHITE = wx.Colour(255, 255, 255)
+COLOR_BLACK = wx.Colour(0, 0, 0)
 COLOR_GREY = wx.Colour(232, 232, 232)
 COLOR_WA = wx.Colour(37, 211, 102)
+COLOR_DONE = wx.Colour(198, 239, 206)       # hijau tipis (baris sudah selesai)
+COLOR_DONE_TEXT = wx.Colour(0, 97, 0)
 
-MONTHS_ID = {
-    "januari": 1, "februari": 2, "maret": 3, "april": 4, "mei": 5, "juni": 6,
-    "juli": 7, "agustus": 8, "september": 9, "oktober": 10, "november": 11, "desember": 12,
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "agu": 8, "agt": 8,
-    "ags": 8, "sep": 9, "okt": 10, "nov": 11, "des": 12,
+# ----------------------------------------------------------- bulan Indonesia
+MONTH_FULL = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli",
+              "Agustus", "September", "Oktober", "November", "Desember"]
+MONTH_MAP = {n.lower(): i for i, n in enumerate(MONTH_FULL, 1)}
+MONTH_MAP.update({
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "agu": 8,
+    "agt": 8, "ags": 8, "agus": 8, "sep": 9, "sept": 9, "okt": 10, "nov": 11,
+    "des": 12,
     # cadangan bahasa Inggris
     "january": 1, "february": 2, "march": 3, "may": 5, "june": 6, "july": 7,
     "august": 8, "october": 10, "december": 12, "aug": 8, "oct": 10, "dec": 12,
-}
+})
+
+
+def month_number(word):
+    """Nama bulan -> 1..12. Toleran salah baca OCR (misal 'Agustu5')."""
+    w = (word or "").lower().strip(". ")
+    if w in MONTH_MAP:
+        return MONTH_MAP[w]
+    close = difflib.get_close_matches(w, list(MONTH_MAP), n=1, cutoff=0.75)
+    return MONTH_MAP[close[0]] if close else None
 
 
 # ------------------------------------------------------ simpan pilihan database
@@ -110,12 +175,44 @@ def save_last_db(path):
         pass
 
 
+# ------------------------------------------------------------------------ OCR
+def boxes_to_text(result):
+    """Susun hasil RapidOCR (kotak + teks) jadi teks per baris, urut atas ke bawah."""
+    if not result:
+        return ""
+    items = []
+    for box, txt, *_ in result:
+        ys = [p[1] for p in box]
+        xs = [p[0] for p in box]
+        items.append((sum(ys) / len(ys), min(xs), max(ys) - min(ys), txt))
+    items.sort(key=lambda t: t[0])
+    lines = []
+    for yc, x, h, txt in items:
+        if lines and abs(yc - lines[-1]["y"]) <= 0.6 * max(h, lines[-1]["h"]):
+            lines[-1]["items"].append((x, txt))
+        else:
+            lines.append({"y": yc, "h": h, "items": [(x, txt)]})
+    return "\n".join(" ".join(t for _, t in sorted(ln["items"])) for ln in lines)
+
+
+def run_ocr(rgb):
+    """rgb = array numpy (tinggi, lebar, 3) warna RGB. Kembalikan teks hasil OCR."""
+    with OCR_LOCK:
+        if RapidOCR is not None:
+            if _OCR["engine"] is None:
+                _OCR["engine"] = RapidOCR()
+            bgr = np.ascontiguousarray(rgb[:, :, ::-1])
+            result, _ = _OCR["engine"](bgr)
+            return boxes_to_text(result)
+        if pytesseract is not None:
+            return pytesseract.image_to_string(Image.fromarray(rgb), lang="eng")
+    return ""
+
+
 # ---------------------------------------------------------------- PDF parsing
 FIELD_LABELS = {
     "no_peserta": ["Nomor Peserta", "No. Peserta", "No Peserta"],
     "no_rekammedis": ["Nomor Rekam Medis", "No. Rekam Medis", "No Rekam Medis", "No. RM"],
-    "umur": ["Umur Tahun", "Umur"],
-    "tanggal_lahir": ["Tanggal Lahir", "Tgl. Lahir", "Tgl Lahir"],
     "no_SEP": ["Nomor SEP", "No. SEP", "No SEP"],
     "tgl_masuk": ["Tanggal Masuk", "Tgl. Masuk", "Tgl Masuk"],
     "tgl_keluar": ["Tanggal Keluar", "Tgl. Keluar", "Tgl Keluar"],
@@ -131,18 +228,20 @@ PHONE_LABEL_RE = re.compile(
 # cadangan: nomor HP berpola 08xxxxxxxxxx / 628xxxxxxxxxx / +628xxxxxxxxxx
 PHONE_LIKE_RE = re.compile(r"(?<![\d])((?:\+?62|0)8\d{8,12})(?![\d])")
 
-# "Control Ulang : 29 Agustus 2026"  (juga terima "Kontrol Ulang" & format 29/08/2026)
-CONTROL_RE = re.compile(
-    r"(?:Control|Kontrol)\s*Ulang\s*[:：]?\s*"
-    r"(\d{1,2}[ \t]+[A-Za-z]+[ \t]+\d{4}|\d{1,2}[/\-.]\d{1,2}[/\-.]\d{4})",
-    re.IGNORECASE,
-)
+# "Kontrol Ulang : 29 Agustus 2026" (toleran: Kontrol/Control, salah baca OCR)
+CONTROL_LABEL_RE = re.compile(r"[KC][o0]ntr[o0][l1I|]\s*U[l1I|]ang", re.IGNORECASE)
+DATE_TEXT_RE = re.compile(r"(\d{1,2})\s*([A-Za-z]{3,10})\.?\s*,?\s*(20\d{2})")
+DATE_NUM_RE = re.compile(r"(\d{1,2})\s*[/\-.]\s*(\d{1,2})\s*[/\-.]\s*(20\d{2})")
+
+# "Nama Dokter : IRFAN FIRMANSYAH, Sp.U. dr" (toleran salah baca OCR pada kata Dokter)
+DOCTOR_RE = re.compile(r"Nama\s*Dok[a-z1|]{1,3}r\s*[:：;.]?\s*([^\n]*)", re.IGNORECASE)
 
 
 class PdfDoc:
     def __init__(self, path):
         self.doc = None
         self.reader = None
+        self.ocr_used = False
         if fitz:
             self.doc = fitz.open(path)
             self.count = self.doc.page_count
@@ -152,6 +251,7 @@ class PdfDoc:
         else:
             raise RuntimeError("Install dulu: pip install pymupdf")
         self._cache = {}
+        self._ocr_cache = {}
 
     def text(self, i):
         if i in self._cache:
@@ -164,6 +264,30 @@ class PdfDoc:
         except Exception:
             t = ""
         self._cache[i] = t
+        return t
+
+    def is_low_text(self, i):
+        """Halaman yang hampir tidak punya teks = kemungkinan hasil scan gambar."""
+        return len(self.text(i).strip()) < 60
+
+    def ocr_text(self, i):
+        """Render halaman jadi gambar lalu baca dengan OCR (hasil disimpan sementara)."""
+        if i in self._ocr_cache:
+            return self._ocr_cache[i]
+        t = ""
+        if self.doc is not None and OCR_AVAILABLE:
+            try:
+                pix = self.doc[i].get_pixmap(dpi=OCR_DPI, alpha=False)
+                arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+                if pix.n == 1:
+                    arr = np.repeat(arr, 3, axis=2)
+                elif pix.n > 3:
+                    arr = arr[:, :, :3]
+                t = run_ocr(arr)
+                self.ocr_used = True
+            except Exception:
+                t = ""
+        self._ocr_cache[i] = t
         return t
 
     def close(self):
@@ -201,11 +325,6 @@ def normalize_gender(val):
     if "perempuan" in low or "wanita" in low:
         return "Perempuan"
     return ""
-
-
-def first_number(val):
-    m = re.search(r"\d+", val or "")
-    return m.group(0) if m else ""
 
 
 def clean_phone(val):
@@ -255,47 +374,104 @@ def extract_phone(pdf, exclude):
 
 
 def control_from_text(text):
-    """Cari 'Control Ulang : 29 Agustus 2026' di satu halaman."""
-    m = CONTROL_RE.search(text)
-    if m:
-        return re.sub(r"\s+", " ", m.group(1)).strip()
+    """Cari tanggal setelah tulisan 'Kontrol/Control Ulang' (teks PDF atau hasil OCR)."""
+    for m in CONTROL_LABEL_RE.finditer(text):
+        win = text[m.end(): m.end() + 60]
+        cands = []
+        for dm in DATE_TEXT_RE.finditer(win):
+            mo = month_number(dm.group(2))
+            if mo:
+                cands.append((dm.start(), f"{dm.group(1)} {MONTH_FULL[mo - 1]} {dm.group(3)}"))
+        for dm in DATE_NUM_RE.finditer(win):
+            cands.append((dm.start(), f"{dm.group(1)}/{dm.group(2)}/{dm.group(3)}"))
+        if cands:
+            cands.sort(key=lambda c: c[0])
+            return cands[0][1]
     return ""
 
 
-def extract_control(pdf):
+def doctor_from_text(text):
+    """Cari 'Nama Dokter : ...' (teks PDF atau hasil OCR)."""
+    m = DOCTOR_RE.search(text)
+    if not m:
+        return ""
+    val = m.group(1).strip()
+    if not val:
+        for line in text[m.end():].split("\n"):
+            line = line.strip()
+            if line:
+                if ":" not in line:
+                    val = line
+                break
+    val = re.split(r"\s{3,}|\t", val)[0].strip()
+    val = re.sub(r"\s+", " ", val)
+    if re.match(r"(?i)(nama|no|nomor|tanggal|tgl|poli|alamat)\b", val):
+        return ""
+    return val
+
+
+def search_pages(pdf, parse, title_words, default_page):
     """
-    Urutan pencarian Control Ulang:
-    1. halaman yang ada tulisan SURAT BUKTI PELAYANAN KESEHATAN / SBPK
-    2. halaman ke-3
-    3. semua halaman
+    Cari data di PDF:
+    1. teks PDF: halaman berjudul title_words, lalu halaman default, lalu semua halaman
+    2. kalau belum ketemu -> OCR: halaman default, lalu halaman yang teksnya sedikit (hasil scan)
     """
     order = []
     for i in range(pdf.count):
-        t = pdf.text(i).upper()
-        t_flat = re.sub(r"\s+", " ", t)
-        if "SURAT BUKTI PELAYANAN KESEHATAN" in t_flat or "SBPK" in t_flat:
+        flat = re.sub(r"\s+", " ", pdf.text(i).upper())
+        if any(w in flat for w in title_words):
             order.append(i)
-    if pdf.count >= 3 and 2 not in order:
-        order.append(2)
+    if pdf.count > default_page and default_page not in order:
+        order.append(default_page)
     for i in range(pdf.count):
         if i not in order:
             order.append(i)
 
     for i in order:
-        val = control_from_text(pdf.text(i))
+        val = parse(pdf.text(i))
+        if val:
+            return val
+
+    if not OCR_AVAILABLE:
+        return ""
+    ocr_pages = []
+    if pdf.count > default_page:
+        ocr_pages.append(default_page)
+    for i in order:
+        if i not in ocr_pages and pdf.is_low_text(i):
+            ocr_pages.append(i)
+    for i in ocr_pages:
+        val = parse(pdf.ocr_text(i))
         if val:
             return val
     return ""
 
 
-def extract_patient(path):
+def extract_control(pdf):
+    """Kontrol Ulang: halaman 'SURAT BUKTI PELAYANAN KESEHATAN (SBPK)' / halaman 3."""
+    return search_pages(
+        pdf, control_from_text,
+        ["SURAT BUKTI PELAYANAN KESEHATAN", "SBPK"], 2,
+    )
+
+
+def extract_doctor(pdf):
+    """Dokter: halaman 'KWITANSI' / halaman 5."""
+    return search_pages(pdf, doctor_from_text, ["KWITANSI"], 4)
+
+
+def extract_patient(path, db):
+    """
+    Baca satu PDF. Return (data, existing).
+    existing = baris yang sudah ada di database (atau None).
+    OCR hanya dijalankan kalau datanya memang belum ada di database.
+    """
     pdf = PdfDoc(path)
     try:
         if pdf.count == 0:
-            return None
+            return None, None
         p1 = pdf.text(0)
         data = {k: find_field(p1, labs) for k, labs in FIELD_LABELS.items()}
-        data["umur"] = first_number(data["umur"])
 
         # Jenis kelamin (halaman 1 dulu, kalau tidak ada cari semua halaman)
         gender = normalize_gender(find_field(p1, GENDER_LABELS))
@@ -325,9 +501,23 @@ def extract_patient(path):
                 exclude.add(v)
         data["no_telepon"] = extract_phone(pdf, exclude)
 
-        # Control Ulang: halaman "SURAT BUKTI PELAYANAN KESEHATAN (SBPK)" (halaman 3)
-        data["control_ulang"] = extract_control(pdf)
-        return data
+        data["control_ulang"] = ""
+        data["dokter"] = ""
+        data["ceklis"] = 0
+
+        has_key = bool(data["nama_peserta"] or data["no_peserta"] or data["no_SEP"])
+        existing = db.find_existing(data) if has_key else None
+
+        def need(key):
+            return existing is None or not str(row_get(existing, key)).strip()
+
+        if has_key:
+            if need("control_ulang"):
+                data["control_ulang"] = extract_control(pdf)
+            if need("dokter"):
+                data["dokter"] = extract_doctor(pdf)
+        data["_ocr"] = pdf.ocr_used
+        return data, existing
     finally:
         pdf.close()
 
@@ -343,6 +533,19 @@ def row_get(row, key):
     return ""
 
 
+def is_done(row):
+    try:
+        return int(row_get(row, "ceklis") or 0) == 1
+    except (ValueError, TypeError):
+        return False
+
+
+def display_value(row, key):
+    if key == "ceklis":
+        return "SUDAH" if is_done(row) else "BELUM"
+    return str(row_get(row, key))
+
+
 def parse_date(text):
     """Ubah '29/08/2026' atau '29 Agustus 2026' jadi (tahun, bulan, hari). Gagal -> None."""
     text = (text or "").strip()
@@ -353,7 +556,7 @@ def parse_date(text):
     m = re.match(r"(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", text)
     if m:
         d, mon, y = m.groups()
-        mo = MONTHS_ID.get(mon.lower())
+        mo = month_number(mon)
         if mo:
             return (int(y), mo, int(d))
     return None
@@ -375,48 +578,75 @@ def sort_key(col_key, value):
     return (0, text.lower()) if text else (1, "")
 
 
+def default_for(key):
+    return 0 if key == "ceklis" else ""
+
+
 # ------------------------------------------------------------------- Database
+def create_sql(table):
+    cols = ",\n".join(f"{k} {t}" for k, _, t in FIELDS)
+    return f"CREATE TABLE IF NOT EXISTS {table} (\n id INTEGER PRIMARY KEY AUTOINCREMENT,\n{cols}\n)"
+
+
 class Database:
     def __init__(self, path):
         self.path = path
-        self.conn = sqlite3.connect(path)
+        self.conn = sqlite3.connect(path, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.create()
 
     def create(self):
-        self.conn.execute(
-            """CREATE TABLE IF NOT EXISTS pasien (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nama_peserta TEXT,
-                no_peserta TEXT,
-                no_rekammedis TEXT,
-                umur TEXT,
-                tanggal_lahir TEXT,
-                no_SEP TEXT,
-                jenis_kelamin TEXT,
-                tgl_masuk TEXT,
-                tgl_keluar TEXT,
-                no_telepon TEXT,
-                control_ulang TEXT
-            )"""
-        )
+        self.conn.execute(create_sql("pasien"))
         self.conn.commit()
         self.migrate()
 
+    def table_cols(self):
+        return [r[1] for r in self.conn.execute("PRAGMA table_info(pasien)")]
+
     def migrate(self):
-        """Samakan tabel lama (kolom versi sebelumnya) dengan struktur terbaru."""
-        cols = {r[1].lower() for r in self.conn.execute("PRAGMA table_info(pasien)")}
+        """Samakan tabel lama dengan struktur terbaru."""
+        cols = self.table_cols()
+        lower = {c.lower() for c in cols}
 
-        if "nama_pasien" in cols and "nama_peserta" not in cols:
-            self.conn.execute("ALTER TABLE pasien RENAME COLUMN Nama_Pasien TO nama_peserta")
-            cols.discard("nama_pasien")
-            cols.add("nama_peserta")
+        if "nama_pasien" in lower and "nama_peserta" not in lower:
+            self.conn.execute("ALTER TABLE pasien RENAME COLUMN nama_pasien TO nama_peserta")
+            self.conn.commit()
+            lower = {c.lower() for c in self.table_cols()}
 
-        # kolom baru (termasuk control_ulang) otomatis ditambah ke tabel lama
-        for field in DB_FIELDS:
-            if field.lower() not in cols:
-                self.conn.execute(f"ALTER TABLE pasien ADD COLUMN {field} TEXT")
+        # hapus kolom umur & tanggal_lahir (tabel dibangun ulang, data lain tetap)
+        if lower & OBSOLETE_COLS:
+            self.rebuild(lower)
+            lower = {c.lower() for c in self.table_cols()}
+
+        # tambah kolom baru (dokter, ceklis, control_ulang) kalau belum ada
+        for key, _, typ in FIELDS:
+            if key.lower() not in lower:
+                self.conn.execute(f"ALTER TABLE pasien ADD COLUMN {key} {typ}")
+        self.conn.execute("UPDATE pasien SET ceklis=0 WHERE ceklis IS NULL")
         self.conn.commit()
+
+    def rebuild(self, old_lower):
+        """Bangun ulang tabel tanpa kolom lama. File backup dibuat dulu."""
+        try:
+            bak = self.path + ".bak_v13"
+            if os.path.isfile(self.path) and not os.path.exists(bak):
+                self.conn.commit()
+                shutil.copy2(self.path, bak)
+        except Exception:
+            pass
+        keep = [k for k in ["id"] + DB_FIELDS if k.lower() in old_lower]
+        cols = ",".join(keep)
+        try:
+            self.conn.execute("DROP TABLE IF EXISTS pasien_old")
+            self.conn.execute("BEGIN")
+            self.conn.execute("ALTER TABLE pasien RENAME TO pasien_old")
+            self.conn.execute(create_sql("pasien"))
+            self.conn.execute(f"INSERT INTO pasien ({cols}) SELECT {cols} FROM pasien_old")
+            self.conn.execute("DROP TABLE pasien_old")
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def count(self):
         return self.conn.execute("SELECT COUNT(*) FROM pasien").fetchone()[0]
@@ -431,10 +661,6 @@ class Database:
                 (d.get("nama_peserta", ""), d.get("no_peserta", ""), d.get("tgl_masuk", "")),
             )
         return cur.fetchone()
-
-    def update_phone(self, pid, phone):
-        self.conn.execute("UPDATE pasien SET no_telepon=? WHERE id=?", (phone, pid))
-        self.conn.commit()
 
     def update_fields(self, pid, fields):
         """Update sebagian kolom saja (hanya kolom yang valid)."""
@@ -453,20 +679,17 @@ class Database:
         qs = ",".join("?" * len(DB_FIELDS))
         self.conn.execute(
             f"INSERT INTO pasien ({cols}) VALUES ({qs})",
-            [d.get(k, "") for k in DB_FIELDS],
+            [d.get(k, default_for(k)) for k in DB_FIELDS],
         )
         self.conn.commit()
 
     def fetch(self, keyword=""):
         if keyword:
             like = f"%{keyword}%"
+            where = " OR ".join(f"{k} LIKE ?" for k in SEARCH_FIELDS)
             cur = self.conn.execute(
-                """SELECT * FROM pasien WHERE nama_peserta LIKE ? OR no_peserta LIKE ?
-                   OR no_rekammedis LIKE ? OR no_SEP LIKE ? OR no_telepon LIKE ?
-                   OR tgl_masuk LIKE ? OR tgl_keluar LIKE ? OR tanggal_lahir LIKE ?
-                   OR jenis_kelamin LIKE ? OR umur LIKE ? OR control_ulang LIKE ?
-                   ORDER BY id DESC""",
-                (like,) * 11,
+                f"SELECT * FROM pasien WHERE {where} ORDER BY id DESC",
+                (like,) * len(SEARCH_FIELDS),
             )
         else:
             cur = self.conn.execute("SELECT * FROM pasien ORDER BY id DESC")
@@ -479,7 +702,7 @@ class Database:
         sets = ",".join(f"{k}=?" for k in DB_FIELDS)
         self.conn.execute(
             f"UPDATE pasien SET {sets} WHERE id=?",
-            [d.get(k, "") for k in DB_FIELDS] + [pid],
+            [d.get(k, default_for(k)) for k in DB_FIELDS] + [pid],
         )
         self.conn.commit()
 
@@ -542,17 +765,18 @@ class EditDialog(wx.Dialog):
         self.ctrls = {}
         grid = wx.FlexGridSizer(0, 2, 8, 10)
         grid.AddGrowableCol(1)
-        for key, label in COLS:
-            if key == "id":
-                continue
+        for key, label, _ in FIELDS:
             val = row_get(row, key)
             grid.Add(wx.StaticText(self, label=label.title()), 0, wx.ALIGN_CENTER_VERTICAL)
             if key == "jenis_kelamin":
                 ctrl = wx.Choice(self, choices=GENDERS)
                 if val in GENDERS:
                     ctrl.SetSelection(GENDERS.index(val))
+            elif key == "ceklis":
+                ctrl = wx.CheckBox(self, label="Sudah selesai")
+                ctrl.SetValue(is_done(row))
             else:
-                ctrl = wx.TextCtrl(self, value=str(val), size=(300, -1))
+                ctrl = wx.TextCtrl(self, value=str(val), size=(320, -1))
             self.ctrls[key] = ctrl
             grid.Add(ctrl, 1, wx.EXPAND)
 
@@ -568,6 +792,8 @@ class EditDialog(wx.Dialog):
             if isinstance(ctrl, wx.Choice):
                 idx = ctrl.GetSelection()
                 out[key] = GENDERS[idx] if idx != wx.NOT_FOUND else ""
+            elif isinstance(ctrl, wx.CheckBox):
+                out[key] = 1 if ctrl.GetValue() else 0
             else:
                 out[key] = ctrl.GetValue().strip()
         return out
@@ -661,7 +887,7 @@ class MainFrame(wx.Frame):
         self.btn_export.SetBackgroundColour(wx.Colour(33, 115, 70))
         self.btn_export.SetForegroundColour(wx.Colour(255, 255, 255))
         self.txt_search = wx.TextCtrl(p, size=(300, -1))
-        self.txt_search.SetHint("Ketik untuk mencari (nama / no. peserta / SEP / telp...)")
+        self.txt_search.SetHint("Ketik untuk mencari (nama / no. peserta / SEP / telp / dokter...)")
         self.lbl_total = wx.StaticText(p, label="Total: 0")
 
         for b in (self.btn_db, self.btn_edit, self.btn_del, self.btn_ref, self.btn_export):
@@ -672,14 +898,15 @@ class MainFrame(wx.Frame):
         s.Add(bar, 0, wx.ALL | wx.EXPAND, 8)
 
         self.grid = gridlib.Grid(p)
-        self.grid.CreateGrid(0, len(COLS) + 1)
-        for i, w in enumerate(COL_WIDTHS):
-            self.grid.SetColSize(i, w)
+        self.grid.CreateGrid(0, len(GRID_COLS))
+        for i, (key, _) in enumerate(GRID_COLS):
+            self.grid.SetColSize(i, COL_WIDTH.get(key, 120))
         self.grid.SetRowLabelSize(0)
         self.grid.EnableEditing(False)
         self.grid.SetSelectionMode(getattr(gridlib.Grid, "GridSelectRows", getattr(gridlib.Grid, "SelectRows", 1)))
         self.update_header_labels()
 
+        # kolom WHATSAPP: hijau, putih, tebal, rata tengah
         attr = gridlib.GridCellAttr()
         attr.SetBackgroundColour(COLOR_WA)
         attr.SetTextColour(wx.Colour(255, 255, 255))
@@ -688,6 +915,14 @@ class MainFrame(wx.Frame):
         fnt.SetWeight(wx.FONTWEIGHT_BOLD)
         attr.SetFont(fnt)
         self.grid.SetColAttr(WA_COL, attr)
+
+        # kolom CEKLIS: tebal, rata tengah (warna diatur per baris)
+        attr2 = gridlib.GridCellAttr()
+        attr2.SetAlignment(wx.ALIGN_CENTRE, wx.ALIGN_CENTRE)
+        fnt2 = wx.Font(self.grid.GetDefaultCellFont())
+        fnt2.SetWeight(wx.FONTWEIGHT_BOLD)
+        attr2.SetFont(fnt2)
+        self.grid.SetColAttr(CEK_COL, attr2)
 
         s.Add(self.grid, 1, wx.LEFT | wx.RIGHT | wx.EXPAND, 8)
 
@@ -715,16 +950,15 @@ class MainFrame(wx.Frame):
 
     # ---------------- sort header
     def update_header_labels(self):
-        for i, (_, label) in enumerate(COLS):
+        for i, (_, label) in enumerate(GRID_COLS):
             arrow = ""
             if i == self.sort_col:
                 arrow = "  ▲" if self.sort_asc else "  ▼"
             self.grid.SetColLabelValue(i, label + arrow)
-        self.grid.SetColLabelValue(WA_COL, "WHATSAPP")
 
     def on_header_click(self, e):
         col = e.GetCol()
-        if col < 0 or col >= len(COLS):
+        if col < 0 or col >= len(GRID_COLS) or GRID_COLS[col][0] == "wa":
             return
         if self.sort_col == col:
             self.sort_asc = not self.sort_asc
@@ -737,10 +971,28 @@ class MainFrame(wx.Frame):
     def sort_rows(self, rows):
         if self.sort_col is None:
             return list(rows)
-        key = COLS[self.sort_col][0]
+        key = GRID_COLS[self.sort_col][0]
         return sorted(rows, key=lambda r: sort_key(key, row_get(r, key)), reverse=not self.sort_asc)
 
     # ---------------- grid
+    def paint_row(self, r, row):
+        """Isi & warnai satu baris. Baris yang sudah di-ceklis -> hijau tipis."""
+        g = self.grid
+        done = is_done(row)
+        bg = COLOR_DONE if done else (COLOR_WHITE if r % 2 == 0 else COLOR_GREY)
+        for c, (key, _) in enumerate(GRID_COLS):
+            if key == "wa":
+                g.SetCellValue(r, c, "WhatsApp")
+                g.SetCellBackgroundColour(r, c, COLOR_WA)
+                g.SetCellTextColour(r, c, COLOR_WHITE)
+                continue
+            if key == "ceklis":
+                g.SetCellValue(r, c, ("✔ " if done else "☐ ") + display_value(row, key))
+                g.SetCellTextColour(r, c, COLOR_DONE_TEXT if done else COLOR_BLACK)
+            else:
+                g.SetCellValue(r, c, display_value(row, key))
+            g.SetCellBackgroundColour(r, c, bg)
+
     def refresh_grid(self):
         try:
             rows = self.sort_rows(self.db.fetch(self.txt_search.GetValue().strip()))
@@ -754,15 +1006,8 @@ class MainFrame(wx.Frame):
         if n:
             g.DeleteRows(0, n)
         g.AppendRows(len(rows))
-        white_text = wx.Colour(255, 255, 255)
         for r, row in enumerate(rows):
-            bg = COLOR_WHITE if r % 2 == 0 else COLOR_GREY  # baris belang
-            for c, (key, _) in enumerate(COLS):
-                g.SetCellValue(r, c, str(row_get(row, key)))
-                g.SetCellBackgroundColour(r, c, bg)
-            g.SetCellValue(r, WA_COL, "WhatsApp")
-            g.SetCellBackgroundColour(r, WA_COL, COLOR_WA)
-            g.SetCellTextColour(r, WA_COL, white_text)
+            self.paint_row(r, row)
         g.EndBatch()
         self.lbl_total.SetLabel(f"Total: {len(rows)}")
         self.right.Layout()
@@ -780,14 +1025,35 @@ class MainFrame(wx.Frame):
 
     def on_cell_click(self, e):
         row, col = e.GetRow(), e.GetCol()
-        if col == WA_COL:
-            self.open_whatsapp(self.grid.GetCellValue(row, PHONE_COL))
+        if 0 <= col < len(GRID_COLS):
+            key = GRID_COLS[col][0]
+            if key == "wa":
+                self.open_whatsapp(self.grid.GetCellValue(row, PHONE_COL))
+            elif key == "ceklis":
+                self.toggle_ceklis(row)
         e.Skip()
 
+    def toggle_ceklis(self, r):
+        """Klik CEKLIS: belum <-> sudah, disimpan ke database, baris jadi hijau tipis."""
+        try:
+            pid = int(self.grid.GetCellValue(r, 0))
+        except ValueError:
+            return
+        row = self.db.get(pid)
+        if not row:
+            return
+        new_val = 0 if is_done(row) else 1
+        self.db.update_fields(pid, {"ceklis": new_val})
+        fresh = self.db.get(pid)
+        if r < len(self.current_rows) and self.current_rows[r]["id"] == pid:
+            self.current_rows[r] = fresh
+        self.paint_row(r, fresh)
+        self.grid.ForceRefresh()
+
     def on_cell_dclick(self, e):
-        """Double klik baris -> UBAH DATA (kolom WhatsApp diabaikan)."""
+        """Double klik baris -> UBAH DATA (kolom WhatsApp & Ceklis diabaikan)."""
         row, col = e.GetRow(), e.GetCol()
-        if col == WA_COL:
+        if col in (WA_COL, CEK_COL):
             return
         try:
             pid = int(self.grid.GetCellValue(row, 0))
@@ -843,26 +1109,30 @@ class MainFrame(wx.Frame):
             ws.title = "Data Pasien"
 
             # header
-            ws.append([label for _, label in COLS])
+            ws.append([LABELS[k] for k in EXPORT_KEYS])
             head_fill = PatternFill("solid", fgColor="2EB847")
-            for c in range(1, len(COLS) + 1):
+            for c in range(1, len(EXPORT_KEYS) + 1):
                 cell = ws.cell(row=1, column=c)
                 cell.font = Font(bold=True, color="FFFFFF")
                 cell.fill = head_fill
                 cell.alignment = Alignment(horizontal="center", vertical="center")
 
             # isi data (semua disimpan sebagai teks supaya angka 0 di depan tidak hilang)
+            done_fill = PatternFill("solid", fgColor="C6EFCE")
             for row in rows:
-                ws.append([str(row_get(row, key)) for key, _ in COLS])
-            for r in range(2, len(rows) + 2):
-                for c in range(1, len(COLS) + 1):
-                    ws.cell(row=r, column=c).number_format = "@"
+                ws.append([display_value(row, k) for k in EXPORT_KEYS])
+            for r, row in enumerate(rows, 2):
+                for c in range(1, len(EXPORT_KEYS) + 1):
+                    cell = ws.cell(row=r, column=c)
+                    cell.number_format = "@"
+                    if is_done(row):
+                        cell.fill = done_fill  # baris sudah selesai -> hijau tipis
 
             # lebar kolom otomatis
-            for c, (key, label) in enumerate(COLS, 1):
-                longest = len(label)
+            for c, key in enumerate(EXPORT_KEYS, 1):
+                longest = len(LABELS[key])
                 for row in rows:
-                    longest = max(longest, len(str(row_get(row, key))))
+                    longest = max(longest, len(display_value(row, key)))
                 ws.column_dimensions[get_column_letter(c)].width = min(longest + 3, 45)
 
             ws.freeze_panes = "A2"
@@ -954,6 +1224,11 @@ class MainFrame(wx.Frame):
             self.lbl_folder.SetLabel(f"Folder: {folder}")
             self.lbl_folder.SetToolTip(folder)
             self.log.Clear()
+            if not OCR_AVAILABLE:
+                self.log.AppendText(
+                    "[INFO] OCR belum terpasang, halaman hasil scan tidak bisa dibaca.\n"
+                    "       Jalankan di CMD: pip install rapidocr-onnxruntime\n\n"
+                )
             self.cancel = False
             self.btn_folder.Disable()
             self.btn_cancel.Enable()
@@ -978,44 +1253,44 @@ class MainFrame(wx.Frame):
             db.close()
             return
 
+        fill_fields = [("no_telepon", "telp"), ("control_ulang", "kontrol"), ("dokter", "dokter")]
+
         for i, path in enumerate(files, 1):
             if self.cancel:
                 break
             name = os.path.basename(path)
             try:
-                data = extract_patient(path)
+                data, existing = extract_patient(path, db)
                 if not data or not (data["nama_peserta"] or data["no_peserta"] or data["no_SEP"]):
                     gagal += 1
                     msg = f"[GAGAL] {name} - data tidak ditemukan"
                 else:
-                    existing = db.find_existing(data)
+                    tag = " [OCR]" if data.get("_ocr") else ""
                     if existing is None:
                         db.insert(data)
                         baru += 1
                         msg = (
                             f"[BARU ] {name} - {data['nama_peserta']} | "
                             f"telp: {data['no_telepon'] or '-'} | "
-                            f"control: {data['control_ulang'] or '-'}"
+                            f"kontrol: {data['control_ulang'] or '-'} | "
+                            f"dokter: {data['dokter'] or '-'}{tag}"
                         )
                     else:
-                        # isi data yang masih kosong di database (telepon & control ulang)
-                        old_phone = str(row_get(existing, "no_telepon")).strip()
-                        old_ctrl = str(row_get(existing, "control_ulang")).strip()
+                        # isi data yang masih kosong di database
                         fields = {}
                         notes = []
-                        if not old_phone and data["no_telepon"]:
-                            fields["no_telepon"] = data["no_telepon"]
-                            notes.append(f"telp: {data['no_telepon']}")
-                        if not old_ctrl and data["control_ulang"]:
-                            fields["control_ulang"] = data["control_ulang"]
-                            notes.append(f"control: {data['control_ulang']}")
+                        for key, lab in fill_fields:
+                            old = str(row_get(existing, key)).strip()
+                            if not old and data.get(key):
+                                fields[key] = data[key]
+                                notes.append(f"{lab}: {data[key]}")
                         if fields:
                             db.update_fields(existing["id"], fields)
                             upd += 1
-                            msg = f"[UPDATE] {name} - diisi {', '.join(notes)}"
+                            msg = f"[UPDATE] {name} - diisi {', '.join(notes)}{tag}"
                         else:
                             dup += 1
-                            msg = f"[SKIP ] {name} - sudah ada ({data['nama_peserta']})"
+                            msg = f"[SKIP ] {name} - sudah ada ({data['nama_peserta']}){tag}"
             except Exception as ex:
                 gagal += 1
                 msg = f"[ERROR] {name} - {ex}"
