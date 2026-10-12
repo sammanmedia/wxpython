@@ -1,7 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-Auto Klik Deteksi Layar - Versi 9
+Auto Klik Deteksi Layar - Versi 11
 Windows 10 + wxPython + MSS + Tesseract OCR + OpenCV
+
+BARU DI V11
+-----------
+1. Metode KLIK KANAN.
+2. Metode DRAG: tahan klik kiri di tulisan yang terdeteksi, tarik ke
+   arah pilihan (atas/kanan/bawah/kiri, full = sampai tepi layar,
+   setengah = separuh jarak ke tepi layar), lalu lepas.
+3. F10 = ambil screenshot cepat untuk tahap bermetode
+   SCREENSHOT + KLIK (hanya aktif jika ada tahap aktif dengan metode itu).
+4. Tombol HAPUS (reset semua tahap) dan tampilan footer baru.
+
+BARU DI V10
+-----------
+1. MODE DAFTAR: tulis {namafile.txt} di kolom "Kata deteksi" atau
+   "Teks yang diketik". Tiap putaran, {namafile.txt} diganti satu
+   baris dari file itu. Contoh:  Pencarian {DaftarListAutoKlik.txt}
+   - Boleh pakai lebih dari satu file (baris ke-1 jalan bareng, dst).
+   - Jumlah putaran = jumlah baris file. Habis = otomatis berhenti,
+     walau "Putar Ulang" dicentang.
+2. BATAS TUNGGU per tahap (detik). Terlewati = tahap dianggap gagal.
+   (hanya berlaku di mode daftar; kosong/0 = menunggu terus)
+3. POPUP GAGAL: Lanjut / Berhenti + centang "Lewati".
+4. LOG: Data-Log.txt (ditambah di bawah, ada tanggal & jam).
+   Isi: "1. NINA gagal terdaftar" (kalimat dari kolom "Pesan log").
 """
 
 import io
@@ -49,7 +73,7 @@ except Exception:
 # KONFIGURASI
 # ==================================================
 
-APP_NAME = "Auto Klik Deteksi Layar V9 by Samman Media"
+APP_NAME = "Auto Klik Deteksi Layar V11 by Samman Media"
 
 TESSERACT_PATH = (
     r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -128,20 +152,75 @@ SHOT_PREPARE_DELAY = 400
 # File gambar untuk memeriksa apa yang dilihat program
 DEBUG_FILE = "debug_layar.png"
 
+# ---------- MODE DAFTAR (V10) ----------
+
+# Batas tunggu bawaan per tahap (detik) pada mode daftar
+DEFAULT_TIMEOUT = 10
+
+# Kalimat log bawaan jika kolom "Pesan log" dikosongkan
+DEFAULT_FAIL_MSG = "gagal diproses"
+
+# True = tekan ESC satu kali setelah ada tahap gagal
+# (untuk menutup popup aplikasi sebelum pindah ke nama berikutnya)
+ESC_AFTER_FAIL = False
+
+# Pola penanda daftar: {NamaFile.txt}
+LIST_TOKEN_RE = re.compile(r"\{([^{}]+?\.txt)\}", re.IGNORECASE)
+
 # File konfigurasi (di folder yang sama dengan script)
 CONFIG_NAME = "AutoKlik.cfg"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, CONFIG_NAME)
 
+# File log (di folder yang sama dengan script)
+LOG_FILE = os.path.join(BASE_DIR, "Data-Log.txt")
+
 SHOT_METHOD = "SCREENSHOT + KLIK"
+DRAG_METHOD = "DRAG"
+
+# ---------- DRAG (V11) ----------
+
+# Lama gerakan menarik (detik)
+DRAG_DURATION = 0.6
+
+# Jeda setelah klik kiri ditahan sebelum mouse mulai bergerak
+DRAG_HOLD_DELAY = 0.15
+
+# Jeda setelah sampai tujuan sebelum klik dilepas
+DRAG_RELEASE_DELAY = 0.1
+
+# Jarak aman dari tepi layar (piksel) untuk drag "full"
+DRAG_EDGE_MARGIN = 3
+
+# (tulisan di dropdown, arah x, arah y, pecahan jarak ke tepi layar)
+DRAG_OPTIONS = [
+    ("Mouse ke atas full", 0, -1, 1.0),
+    ("Mouse ke atas setengah", 0, -1, 0.5),
+    ("Mouse ke kanan full", 1, 0, 1.0),
+    ("Mouse ke kanan setengah", 1, 0, 0.5),
+    ("Mouse ke bawah full", 0, 1, 1.0),
+    ("Mouse ke bawah setengah", 0, 1, 0.5),
+    ("Mouse ke kiri full", -1, 0, 1.0),
+    ("Mouse ke kiri setengah", -1, 0, 0.5),
+]
+
+DRAG_LABELS = [option[0] for option in DRAG_OPTIONS]
+
+# ---------- TAMPILAN FOOTER (V11) ----------
+
+# Garis tipis pemisah BODY (daftar tahap) dan FOOTER (tombol)
+FOOTER_LINE_COLOUR = (0, 120, 215)
+FOOTER_LINE_HEIGHT = 2
 
 METHODS = [
     "KLIK",
     "KLIK GANDA",
+    "KLIK KANAN",
     "KETIK",
     "LANGSUNG KETIK",
     "SCROLL",
+    DRAG_METHOD,
     SHOT_METHOD,
 ]
 
@@ -248,6 +327,150 @@ def format_hms(total_seconds):
     seconds = total_seconds % 60
 
     return f"{hours}:{minutes:02d}:{seconds:02d}"
+
+
+# ==================================================
+# BANTUAN DRAG (V11)
+# ==================================================
+
+def drag_destination(x, y, label, bounds):
+    """
+    Hitung titik tujuan drag dari titik awal (x, y).
+    bounds = (kiri, atas, kanan, bawah) layar tempat titik berada.
+    full = sampai tepi layar, setengah = separuh jarak ke tepi.
+    """
+    option = DRAG_OPTIONS[0]
+
+    for item in DRAG_OPTIONS:
+        if item[0] == label:
+            option = item
+            break
+
+    _, dx, dy, fraction = option
+    left, top, right, bottom = bounds
+    margin = DRAG_EDGE_MARGIN
+
+    if dx > 0:
+        distance = (right - margin) - x
+    elif dx < 0:
+        distance = x - (left + margin)
+    elif dy > 0:
+        distance = (bottom - margin) - y
+    else:
+        distance = y - (top + margin)
+
+    distance = max(0, int(distance * fraction))
+
+    return x + dx * distance, y + dy * distance
+
+
+# ==================================================
+# BANTUAN DAFTAR (V10)
+# ==================================================
+
+def find_list_tokens(text):
+    """Daftar nama file {xxx.txt} yang ada di dalam teks."""
+    return [
+        match.group(1).strip()
+        for match in LIST_TOKEN_RE.finditer(text or "")
+    ]
+
+
+def render_template(text, values):
+    """Ganti {xxx.txt} dengan isi baris yang sedang dipakai."""
+    def replace(match):
+        key = match.group(1).strip()
+        return values.get(key, match.group(0))
+
+    return LIST_TOKEN_RE.sub(replace, text or "")
+
+
+def read_list_file(token):
+    """
+    Baca file daftar. Satu baris = satu data, baris kosong dilewati.
+    Mengembalikan (daftar, None) atau (None, pesan_error).
+    """
+    if os.path.isabs(token):
+        path = token
+    else:
+        path = os.path.join(BASE_DIR, token)
+
+    if not os.path.isfile(path):
+        return None, f"File daftar tidak ditemukan:\n\n{path}"
+
+    try:
+        with open(path, "rb") as file:
+            raw = file.read()
+    except Exception as error:
+        return None, f"File daftar tidak bisa dibaca:\n\n{path}\n{error}"
+
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("cp1252", errors="replace")
+
+    lines = [line.strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+
+    if not lines:
+        return None, f"File daftar kosong:\n\n{path}"
+
+    return lines, None
+
+
+def step_templates(step):
+    """Nama file daftar yang dipakai sebuah tahap (urut kemunculan)."""
+    found = []
+
+    if step["method"] not in NO_KEYWORD_METHODS:
+        found.extend(find_list_tokens(step["keyword"]))
+
+    if step["method"] in TYPING_METHODS:
+        found.extend(find_list_tokens(step["typing"]))
+
+    return found
+
+
+# ==================================================
+# POPUP SAAT TAHAP GAGAL (V10)
+# ==================================================
+
+class FailDialog(wx.Dialog):
+
+    def __init__(self, parent, message):
+        super().__init__(
+            parent,
+            title="Tahap gagal",
+            style=wx.DEFAULT_DIALOG_STYLE | wx.STAY_ON_TOP
+        )
+
+        root = wx.BoxSizer(wx.VERTICAL)
+
+        text = wx.StaticText(self, label=message)
+        text.Wrap(420)
+
+        self.chk = wx.CheckBox(
+            self,
+            label="Lewati (data berikutnya yang gagal otomatis "
+                  "dilewati dan dicatat di log)"
+        )
+
+        buttons = wx.BoxSizer(wx.HORIZONTAL)
+
+        btn_continue = wx.Button(self, wx.ID_OK, "LANJUT")
+        btn_stop = wx.Button(self, wx.ID_CANCEL, "BERHENTI")
+
+        buttons.Add(btn_continue, 0, wx.RIGHT, 10)
+        buttons.Add(btn_stop, 0)
+
+        root.Add(text, 0, wx.ALL, 14)
+        root.Add(self.chk, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 14)
+        root.Add(buttons, 0, wx.ALIGN_CENTER | wx.BOTTOM, 14)
+
+        self.SetSizerAndFit(root)
+        self.CentreOnScreen()
+
+        btn_continue.SetDefault()
 
 
 # ==================================================
@@ -498,12 +721,13 @@ class ScreenshotOverlay(wx.Frame):
 class AutoKlikDeteksiLayar(wx.Frame):
 
     HOTKEY_ID = 9001
+    HOTKEY_F10_ID = 9002
 
     def __init__(self):
         super().__init__(
             None,
             title=APP_NAME,
-            size=(860, 840)
+            size=(860, 940)
         )
 
         self.running = False
@@ -513,6 +737,19 @@ class AutoKlikDeteksiLayar(wx.Frame):
 
         self.overlay = None
         self.capture_row = None
+
+        # V10: popup gagal dan log
+        self.fail_dialog = None
+        self.skip_all = False
+        self.log_count = 0
+        self.log_header_written = False
+
+        # V11: hotkey F10 (screenshot cepat)
+        self.f10_registered = False
+        self.last_shot_row = None
+
+        # Satu penangan untuk semua hotkey (F9 dan F10).
+        self.Bind(wx.EVT_HOTKEY, self.on_hotkey)
 
         self.build_ui()
         self.load_config_startup()
@@ -524,12 +761,11 @@ class AutoKlikDeteksiLayar(wx.Frame):
             self.RegisterHotKey(
                 self.HOTKEY_ID, wx.MOD_NONE, wx.WXK_F9
             )
-            self.Bind(
-                wx.EVT_HOTKEY, self.on_hotkey,
-                id=self.HOTKEY_ID
-            )
         except Exception:
             pass
+
+        # F10 = screenshot cepat (hanya jika ada tahap SCREENSHOT + KLIK)
+        self.update_f10_hotkey()
 
     # ==================================================
     # MEMBUAT TAMPILAN
@@ -568,7 +804,18 @@ class AutoKlikDeteksiLayar(wx.Frame):
                 "setelah aksi tahap itu.\n"
                 "Idupin Delay = tahap menunggu dulu sebelum "
                 "dijalankan (contoh: 1:15:00, 15:00, atau 15).  "
-                "Putar Ulang = mengulang dari tahap 1."
+                "Putar Ulang = mengulang dari tahap 1.\n"
+                "MODE DAFTAR: tulis {NamaFile.txt} di Kata deteksi "
+                "atau Teks yang diketik (contoh: Pencarian "
+                "{DaftarListAutoKlik.txt}). Tiap putaran diganti "
+                "satu baris file. Selesai otomatis di baris terakhir. "
+                "Kegagalan dicatat di Data-Log.txt.\n"
+                "KLIK KANAN = klik kanan pada tulisan.  "
+                "DRAG = tahan klik kiri pada tulisan lalu tarik ke arah "
+                "pilihan (full = sampai tepi layar, setengah = separuh "
+                "jarak).\n"
+                "F10 = ambil screenshot cepat (aktif jika ada tahap "
+                "bermetode SCREENSHOT + KLIK)."
             )
         )
         root.Add(
@@ -595,41 +842,38 @@ class AutoKlikDeteksiLayar(wx.Frame):
         for _ in range(DEFAULT_STEPS):
             self.add_step()
 
-        # Tombol tambah tahap dan pilih config
-        tools = wx.BoxSizer(wx.HORIZONTAL)
+        # Garis tipis biru: pemisah BODY (daftar tahap) dan FOOTER (tombol)
+        footer_line = wx.Panel(panel, size=(-1, FOOTER_LINE_HEIGHT))
+        footer_line.SetMinSize((-1, FOOTER_LINE_HEIGHT))
+        footer_line.SetBackgroundColour(wx.Colour(*FOOTER_LINE_COLOUR))
 
+        root.Add(footer_line, 0, wx.EXPAND | wx.TOP, 6)
+
+        # Baris 1: tambah tahap (selebar footer)
         self.btn_add = wx.Button(
             panel,
             label="+ TAMBAH TAHAP",
-            size=(200, 32)
+            size=(-1, 34)
         )
-
-        self.btn_config = wx.Button(
-            panel,
-            label="PILIH CONFIG",
-            size=(200, 32)
-        )
-
-        tools.Add(self.btn_add, 0, wx.RIGHT, 10)
-        tools.Add(self.btn_config, 0)
 
         root.Add(
-            tools, 0,
-            wx.ALIGN_CENTER | wx.TOP, 8
+            self.btn_add, 0,
+            wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 12
         )
 
+        # Baris 2: JALANKAN, BERHENTI, SAVE CONFIG, PILIH CONFIG, HAPUS
         buttons = wx.BoxSizer(wx.HORIZONTAL)
 
         self.btn_run = wx.Button(
             panel,
             label="JALANKAN",
-            size=(150, 40)
+            size=(125, 40)
         )
 
         self.btn_stop = wx.Button(
             panel,
             label="BERHENTI",
-            size=(150, 40)
+            size=(125, 40)
         )
 
         self.btn_stop.Disable()
@@ -637,12 +881,34 @@ class AutoKlikDeteksiLayar(wx.Frame):
         self.btn_save = wx.Button(
             panel,
             label="SAVE CONFIG",
-            size=(150, 40)
+            size=(125, 40)
         )
 
-        # Dua centang ditumpuk: Save Konfigurasi di atas,
-        # Putar Ulang di bawahnya.
-        checks = wx.BoxSizer(wx.VERTICAL)
+        self.btn_config = wx.Button(
+            panel,
+            label="PILIH CONFIG",
+            size=(125, 40)
+        )
+
+        self.btn_reset = wx.Button(
+            panel,
+            label="HAPUS",
+            size=(105, 40)
+        )
+
+        buttons.Add(self.btn_run, 0, wx.RIGHT, 8)
+        buttons.Add(self.btn_stop, 0, wx.RIGHT, 8)
+        buttons.Add(self.btn_save, 0, wx.RIGHT, 8)
+        buttons.Add(self.btn_config, 0, wx.RIGHT, 8)
+        buttons.Add(self.btn_reset, 0)
+
+        root.Add(
+            buttons, 0,
+            wx.ALIGN_CENTER | wx.TOP | wx.BOTTOM, 10
+        )
+
+        # Baris 3: dua centang
+        checks = wx.BoxSizer(wx.HORIZONTAL)
 
         self.chk_save = wx.CheckBox(
             panel,
@@ -654,20 +920,12 @@ class AutoKlikDeteksiLayar(wx.Frame):
             label="Putar Ulang"
         )
 
-        checks.Add(self.chk_save, 0, wx.BOTTOM, 6)
+        checks.Add(self.chk_save, 0, wx.RIGHT, 24)
         checks.Add(self.chk_repeat, 0)
 
-        buttons.Add(self.btn_run, 0, wx.RIGHT, 10)
-        buttons.Add(self.btn_stop, 0, wx.RIGHT, 10)
-        buttons.Add(self.btn_save, 0, wx.RIGHT, 16)
-        buttons.Add(
-            checks, 0,
-            wx.ALIGN_CENTER_VERTICAL
-        )
-
         root.Add(
-            buttons, 0,
-            wx.ALIGN_CENTER | wx.ALL, 12
+            checks, 0,
+            wx.ALIGN_CENTER | wx.BOTTOM, 10
         )
 
         self.status = wx.StaticText(
@@ -685,6 +943,7 @@ class AutoKlikDeteksiLayar(wx.Frame):
 
         self.btn_add.Bind(wx.EVT_BUTTON, self.on_add_step)
         self.btn_config.Bind(wx.EVT_BUTTON, self.on_pick_config)
+        self.btn_reset.Bind(wx.EVT_BUTTON, self.on_reset)
         self.btn_run.Bind(wx.EVT_BUTTON, self.start)
         self.btn_stop.Bind(wx.EVT_BUTTON, self.stop)
         self.btn_save.Bind(wx.EVT_BUTTON, self.on_save_config)
@@ -744,6 +1003,11 @@ class AutoKlikDeteksiLayar(wx.Frame):
 
         keyword = wx.TextCtrl(parent)
 
+        keyword.SetToolTip(
+            "Boleh pakai daftar dari file, contoh:\n"
+            "Pencarian {DaftarListAutoKlik.txt}"
+        )
+
         method = wx.Choice(
             parent,
             choices=METHODS
@@ -751,6 +1015,11 @@ class AutoKlikDeteksiLayar(wx.Frame):
         method.SetSelection(0)
 
         typing = wx.TextCtrl(parent)
+
+        typing.SetToolTip(
+            "Boleh pakai daftar dari file, contoh:\n"
+            "{DaftarListAutoKlik.txt}"
+        )
 
         enabled = wx.CheckBox(
             parent,
@@ -783,6 +1052,55 @@ class AutoKlikDeteksiLayar(wx.Frame):
             "15:00 = 15 menit\n"
             "15 = 15 detik"
         )
+
+        # ----- Batas tunggu dan pesan log (mode daftar) -----
+        timeout_text = wx.TextCtrl(
+            parent,
+            size=(55, -1)
+        )
+        timeout_text.SetValue(str(DEFAULT_TIMEOUT))
+        timeout_text.SetToolTip(
+            "Berapa detik tahap ini boleh mencari sebelum dianggap\n"
+            "gagal. Hanya berlaku di MODE DAFTAR.\n"
+            "Kosong atau 0 = menunggu terus."
+        )
+
+        fail_text = wx.TextCtrl(parent)
+
+        try:
+            fail_text.SetHint(DEFAULT_FAIL_MSG)
+        except Exception:
+            pass
+
+        fail_text.SetToolTip(
+            "Kalimat yang ditulis di Data-Log.txt jika tahap ini gagal.\n"
+            "Contoh: gagal terdaftar  /  tidak ada list"
+        )
+
+        fail_row = wx.BoxSizer(wx.HORIZONTAL)
+
+        fail_row.Add(
+            wx.StaticText(parent, label="Batas tunggu"),
+            0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6
+        )
+        fail_row.Add(
+            timeout_text, 0,
+            wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4
+        )
+        fail_row.Add(
+            wx.StaticText(parent, label="detik      Pesan log:"),
+            0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6
+        )
+        fail_row.Add(fail_text, 1, wx.ALIGN_CENTER_VERTICAL)
+
+        # ----- Arah drag (hanya tampil untuk metode DRAG) -----
+        drag_label = wx.StaticText(parent, label="Arah drag:")
+
+        drag_choice = wx.Choice(
+            parent,
+            choices=DRAG_LABELS
+        )
+        drag_choice.SetSelection(0)
 
         # ----- Bagian screenshot (di bawah dropdown metode) -----
         shot_label = wx.StaticText(parent, label="Screenshot:")
@@ -853,6 +1171,9 @@ class AutoKlikDeteksiLayar(wx.Frame):
         grid.Add(shot_label, 0, wx.ALIGN_CENTER_VERTICAL)
         grid.Add(shot_panel, 1, wx.EXPAND)
 
+        grid.Add(drag_label, 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(drag_choice, 1, wx.EXPAND)
+
         grid.Add(
             wx.StaticText(parent, label="Teks yang diketik:"),
             0, wx.ALIGN_CENTER_VERTICAL
@@ -894,9 +1215,17 @@ class AutoKlikDeteksiLayar(wx.Frame):
         )
         grid.Add(options, 1, wx.EXPAND)
 
+        grid.Add(
+            wx.StaticText(parent, label="Jika gagal:"),
+            0, wx.ALIGN_CENTER_VERTICAL
+        )
+        grid.Add(fail_row, 1, wx.EXPAND)
+
         # Bagian screenshot disembunyikan sampai metodenya dipilih.
         grid.Hide(shot_label)
         grid.Hide(shot_panel)
+        grid.Hide(drag_label)
+        grid.Hide(drag_choice)
 
         box.Add(grid, 1, wx.EXPAND | wx.ALL, 8)
 
@@ -919,6 +1248,11 @@ class AutoKlikDeteksiLayar(wx.Frame):
             "enter": enter,
             "delay_check": delay_check,
             "delay_text": delay_text,
+            "timeout": timeout_text,
+            "fail_msg": fail_text,
+            "drag_label": drag_label,
+            "drag": drag_choice,
+            "drag_visible": False,
             "delete": delete_button,
             "shot_label": shot_label,
             "shot_panel": shot_panel,
@@ -946,7 +1280,7 @@ class AutoKlikDeteksiLayar(wx.Frame):
 
         method.Bind(
             wx.EVT_CHOICE,
-            lambda event, r=row: self.refresh_row(r)
+            lambda event, r=row: self.on_method_changed(r)
         )
 
         btn1.Bind(
@@ -993,6 +1327,55 @@ class AutoKlikDeteksiLayar(wx.Frame):
             self.apply_row_color(item, index)
 
         self.relayout()
+        self.update_f10_hotkey()
+
+    def on_reset(self, event):
+        """Tombol HAPUS: kembalikan semua tahap seperti baru dibuka."""
+        if self.running or self.overlay is not None:
+            return
+
+        answer = wx.MessageBox(
+            "Semua Deteksi klik (kata deteksi, metode, screenshot, "
+            "delay, dan lainnya) akan dihapus / direset seperti awal.\n\n"
+            "Lanjutkan?",
+            APP_NAME,
+            wx.YES_NO | wx.ICON_QUESTION
+        )
+
+        if answer != wx.YES:
+            return
+
+        self.reset_steps()
+        self.set_status("Semua tahap sudah direset.")
+
+    def reset_steps(self):
+        """Hapus tahap tambahan dan kosongkan tahap bawaan."""
+        for row in list(self.rows[DEFAULT_STEPS:]):
+            self.remove_step(row)
+
+        for index, row in enumerate(self.rows):
+            row["keyword"].SetValue("KIRIM" if index == 0 else "")
+            row["method"].SetSelection(0)
+            row["typing"].SetValue("")
+            row["enabled"].SetValue(index == 0)
+            row["enter"].SetValue(False)
+            row["delay_check"].SetValue(False)
+            row["delay_text"].SetValue("")
+            row["timeout"].SetValue(str(DEFAULT_TIMEOUT))
+            row["fail_msg"].SetValue("")
+            row["drag"].SetSelection(0)
+            row["image"] = None
+            row["shot_state"] = "idle"
+
+            self.refresh_row(row)
+
+        self.last_shot_row = None
+        self.relayout()
+
+        try:
+            self.scroll.Scroll(0, 0)
+        except Exception:
+            pass
 
     def on_add_step(self, event):
         if self.running:
@@ -1050,6 +1433,24 @@ class AutoKlikDeteksiLayar(wx.Frame):
             active and row["delay_check"].GetValue()
         )
 
+        # Batas tunggu dan pesan log.
+        # LANGSUNG KETIK tidak pernah gagal, jadi tidak memakainya.
+        can_fail = active and method != "LANGSUNG KETIK"
+
+        row["timeout"].Enable(can_fail)
+        row["fail_msg"].Enable(can_fail)
+
+        # Pilihan arah drag: tampil hanya untuk metode DRAG.
+        row["drag"].Enable(active)
+
+        show_drag = (method == DRAG_METHOD)
+
+        if show_drag != row["drag_visible"]:
+            row["drag_visible"] = show_drag
+            row["grid"].Show(row["drag_label"], show_drag)
+            row["grid"].Show(row["drag"], show_drag)
+            self.relayout_row(row)
+
         # Tampilkan bagian screenshot hanya untuk metodenya.
         show_shot = (method == SHOT_METHOD)
 
@@ -1061,6 +1462,47 @@ class AutoKlikDeteksiLayar(wx.Frame):
 
         self.update_shot_ui(row)
 
+        # F10 hanya hidup jika ada tahap aktif bermetode SCREENSHOT + KLIK.
+        self.update_f10_hotkey()
+
+    def on_method_changed(self, row):
+        if row["method"].GetStringSelection() == SHOT_METHOD:
+            self.last_shot_row = row
+
+        self.refresh_row(row)
+
+    def update_f10_hotkey(self):
+        """
+        Daftarkan F10 hanya saat dibutuhkan (ada tahap aktif dengan
+        metode SCREENSHOT + KLIK dan proses tidak sedang jalan).
+        Selain itu F10 dilepas supaya tidak mengganggu aplikasi lain.
+        """
+        if not self:
+            return
+
+        want = (not self.running) and any(
+            row["enabled"].GetValue()
+            and row["method"].GetStringSelection() == SHOT_METHOD
+            for row in self.rows
+        )
+
+        if want and not self.f10_registered:
+            try:
+                self.f10_registered = bool(
+                    self.RegisterHotKey(
+                        self.HOTKEY_F10_ID, wx.MOD_NONE, wx.WXK_F10
+                    )
+                )
+            except Exception:
+                self.f10_registered = False
+        elif not want and self.f10_registered:
+            try:
+                self.UnregisterHotKey(self.HOTKEY_F10_ID)
+            except Exception:
+                pass
+
+            self.f10_registered = False
+
     def set_status(self, message):
         wx.CallAfter(
             self.status.SetLabel,
@@ -1068,7 +1510,63 @@ class AutoKlikDeteksiLayar(wx.Frame):
         )
 
     def on_hotkey(self, event):
-        self.stop()
+        hotkey_id = event.GetId()
+
+        if hotkey_id == self.HOTKEY_ID:
+            self.stop()
+        elif hotkey_id == self.HOTKEY_F10_ID:
+            self.on_f10()
+
+    def pick_shot_row(self):
+        """
+        Pilih tahap untuk F10: tahap aktif bermetode SCREENSHOT + KLIK
+        yang belum punya gambar; jika semua sudah punya, tahap yang
+        terakhir disentuh (atau yang pertama).
+        """
+        candidates = [
+            row for row in self.rows
+            if row["enabled"].GetValue()
+            and row["method"].GetStringSelection() == SHOT_METHOD
+        ]
+
+        if not candidates:
+            return None
+
+        for row in candidates:
+            if row["image"] is None:
+                return row
+
+        if self.last_shot_row in candidates:
+            return self.last_shot_row
+
+        return candidates[0]
+
+    def show_row(self, row):
+        """Gulung daftar tahap supaya tahap ini kelihatan."""
+        try:
+            position = self.scroll.CalcUnscrolledPosition(
+                row["panel"].GetPosition()
+            )
+            self.scroll.Scroll(0, max(0, position.y // 20))
+        except Exception:
+            pass
+
+    def on_f10(self):
+        """F10: screenshot cepat untuk tahap SCREENSHOT + KLIK."""
+        if self.running or self.overlay is not None:
+            return
+
+        row = self.pick_shot_row()
+
+        if row is None:
+            self.set_status(
+                "F10 hanya aktif jika ada tahap bermetode "
+                "SCREENSHOT + KLIK."
+            )
+            return
+
+        self.show_row(row)
+        self.begin_capture(row)
 
     # ==================================================
     # SCREENSHOT: TOMBOL DAN STATUSNYA
@@ -1152,6 +1650,7 @@ class AutoKlikDeteksiLayar(wx.Frame):
             return
 
         self.capture_row = row
+        self.last_shot_row = row
 
         self.set_status("Menyiapkan screenshot...")
 
@@ -1241,6 +1740,9 @@ class AutoKlikDeteksiLayar(wx.Frame):
                 "enter": row["enter"].GetValue(),
                 "delay_on": row["delay_check"].GetValue(),
                 "delay": row["delay_text"].GetValue(),
+                "timeout": row["timeout"].GetValue(),
+                "fail_msg": row["fail_msg"].GetValue(),
+                "drag": row["drag"].GetStringSelection(),
                 "image": image_text,
             })
 
@@ -1364,6 +1866,22 @@ class AutoKlikDeteksiLayar(wx.Frame):
             )
             row["delay_text"].SetValue(str(saved.get("delay", "")))
 
+            # Config lama (V9) tidak punya dua isian ini.
+            row["timeout"].SetValue(
+                str(saved.get("timeout", str(DEFAULT_TIMEOUT)))
+            )
+            row["fail_msg"].SetValue(str(saved.get("fail_msg", "")))
+
+            # Config lama (V9/V10) tidak punya arah drag.
+            drag_index = row["drag"].FindString(
+                str(saved.get("drag", DRAG_LABELS[0]))
+            )
+
+            if drag_index == wx.NOT_FOUND:
+                drag_index = 0
+
+            row["drag"].SetSelection(drag_index)
+
             method_index = row["method"].FindString(
                 str(saved.get("method", "KLIK"))
             )
@@ -1449,6 +1967,67 @@ class AutoKlikDeteksiLayar(wx.Frame):
     # ==================================================
     # VALIDASI DAN MULAI
     # ==================================================
+
+    def build_plan(self, steps):
+        """
+        Siapkan MODE DAFTAR. Mengembalikan:
+          (None, True)   -> tidak ada {file.txt}, mode biasa
+          (plan, True)   -> mode daftar siap
+          (None, False)  -> gagal / dibatalkan (pesan sudah tampil)
+        """
+        files = []
+
+        for step in steps:
+            for token in step_templates(step):
+                if token not in files:
+                    files.append(token)
+
+        if not files:
+            return None, True
+
+        data = {}
+
+        for token in files:
+            lines, error = read_list_file(token)
+
+            if error:
+                wx.MessageBox(
+                    error,
+                    APP_NAME,
+                    wx.OK | wx.ICON_ERROR
+                )
+                return None, False
+
+            data[token] = lines
+
+        counts = {token: len(lines) for token, lines in data.items()}
+        count = min(counts.values())
+
+        if len(set(counts.values())) > 1:
+            detail = "\n".join(
+                f"  {token} : {amount} baris"
+                for token, amount in counts.items()
+            )
+
+            answer = wx.MessageBox(
+                "Jumlah baris tiap file berbeda:\n\n"
+                f"{detail}\n\n"
+                f"Jika lanjut, hanya {count} baris pertama yang "
+                "dijalankan.\nLanjutkan?",
+                APP_NAME,
+                wx.YES_NO | wx.ICON_QUESTION
+            )
+
+            if answer != wx.YES:
+                return None, False
+
+        plan = {
+            "data": data,
+            "order": files,
+            "count": count,
+        }
+
+        return plan, True
 
     def start(self, event):
         if self.running or self.overlay is not None:
@@ -1547,6 +2126,22 @@ class AutoKlikDeteksiLayar(wx.Frame):
                     )
                     return
 
+            # Batas tunggu (detik). Kosong atau 0 = menunggu terus.
+            timeout_raw = row["timeout"].GetValue().strip()
+
+            if not timeout_raw:
+                timeout_seconds = 0
+            elif re.fullmatch(r"[0-9]+", timeout_raw):
+                timeout_seconds = int(timeout_raw)
+            else:
+                wx.MessageBox(
+                    f"Batas tunggu tahap {index + 1} harus berupa "
+                    "angka (detik).",
+                    APP_NAME,
+                    wx.OK | wx.ICON_WARNING
+                )
+                return
+
             steps.append({
                 "keyword": keyword,
                 "method": method,
@@ -1554,8 +2149,16 @@ class AutoKlikDeteksiLayar(wx.Frame):
                 "enter": press_enter,
                 "image": row["image"],
                 "delay": delay_seconds,
+                "timeout": timeout_seconds,
+                "fail_msg": row["fail_msg"].GetValue().strip(),
+                "drag": row["drag"].GetStringSelection(),
                 "number": index + 1,
             })
+
+        plan, ok = self.build_plan(steps)
+
+        if not ok:
+            return
 
         repeat = self.chk_repeat.GetValue()
 
@@ -1568,7 +2171,11 @@ class AutoKlikDeteksiLayar(wx.Frame):
         self.btn_run.Disable()
         self.btn_add.Disable()
         self.btn_config.Disable()
+        self.btn_reset.Disable()
         self.btn_stop.Enable()
+
+        # Lepas F10 selama proses berjalan.
+        self.update_f10_hotkey()
 
         self.set_status(
             "Memulai... jendela di-minimize (F9 = berhenti)"
@@ -1580,7 +2187,7 @@ class AutoKlikDeteksiLayar(wx.Frame):
 
         self.worker = threading.Thread(
             target=self.process_screen,
-            args=(steps, repeat),
+            args=(steps, repeat, plan),
             daemon=True
         )
         self.worker.start()
@@ -1831,6 +2438,107 @@ class AutoKlikDeteksiLayar(wx.Frame):
         except Exception:
             pass
 
+    @staticmethod
+    def past_deadline(deadline):
+        return deadline is not None and time.monotonic() >= deadline
+
+    # ==================================================
+    # LOG (Data-Log.txt)
+    # ==================================================
+
+    def write_log(self, name, message):
+        """
+        Tambah satu baris di Data-Log.txt, contoh:
+            1. NINA gagal terdaftar
+        Nomor mulai dari 1 tiap kali JALANKAN. Ada judul tanggal
+        dan jam di awal tiap sesi.
+        """
+        self.log_count += 1
+
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as file:
+                if not self.log_header_written:
+                    stamp = time.strftime("%d-%m-%Y %H:%M:%S")
+                    file.write(f"\n=== {stamp} ===\n")
+                    self.log_header_written = True
+
+                file.write(f"{self.log_count}. {name} {message}\n")
+        except Exception:
+            traceback.print_exc()
+
+    # ==================================================
+    # POPUP GAGAL
+    # ==================================================
+
+    def close_fail_dialog(self):
+        dialog = self.fail_dialog
+
+        if dialog is not None:
+            try:
+                dialog.EndModal(wx.ID_CANCEL)
+            except Exception:
+                pass
+
+    def ask_failure(self, name, step_number, message):
+        """
+        Tampilkan popup Lanjut / Berhenti (dipanggil dari thread kerja).
+        Mengembalikan "continue" atau "stop".
+        """
+        holder = {"result": "stop", "skip": False}
+        done = threading.Event()
+
+        text = (
+            f"Data: {name}\n"
+            f"Gagal di tahap {step_number}: {message}\n\n"
+            "LANJUT = lewati data ini, lanjut ke data berikutnya.\n"
+            "BERHENTI = hentikan proses."
+        )
+
+        def show():
+            try:
+                if not self:
+                    return
+
+                self.Iconize(False)
+                self.Raise()
+
+                dialog = FailDialog(self, text)
+                self.fail_dialog = dialog
+
+                code = dialog.ShowModal()
+
+                holder["result"] = (
+                    "continue" if code == wx.ID_OK else "stop"
+                )
+                holder["skip"] = dialog.chk.GetValue()
+
+                dialog.Destroy()
+            except Exception:
+                traceback.print_exc()
+            finally:
+                self.fail_dialog = None
+                done.set()
+
+        wx.CallAfter(show)
+
+        # Tunggu jawaban. F9 saat popup terbuka ikut menutupnya.
+        while not done.wait(0.2):
+            if self.stop_event.is_set():
+                wx.CallAfter(self.close_fail_dialog)
+
+        if self.stop_event.is_set():
+            return "stop"
+
+        if holder["result"] == "continue":
+            if holder["skip"]:
+                self.skip_all = True
+
+            # Minimize lagi supaya layar target tidak tertutup.
+            wx.CallAfter(self.Iconize, True)
+            self.stop_event.wait(MINIMIZE_DELAY)
+
+        return holder["result"]
+
     # ==================================================
     # AKSI
     # ==================================================
@@ -1875,7 +2583,61 @@ class AutoKlikDeteksiLayar(wx.Frame):
 
         pyautogui.press("enter")
 
-    def do_action(self, step, x, y):
+    @staticmethod
+    def bounds_for_point(screen, monitor, x, y):
+        """Batas layar (kiri, atas, kanan, bawah) tempat titik berada."""
+        try:
+            for item in screen.monitors[1:]:
+                left = item["left"]
+                top = item["top"]
+
+                if (
+                    left <= x < left + item["width"]
+                    and top <= y < top + item["height"]
+                ):
+                    return (
+                        left,
+                        top,
+                        left + item["width"] - 1,
+                        top + item["height"] - 1
+                    )
+        except Exception:
+            pass
+
+        return (
+            monitor["left"],
+            monitor["top"],
+            monitor["left"] + monitor["width"] - 1,
+            monitor["top"] + monitor["height"] - 1
+        )
+
+    def do_drag(self, step, x, y, bounds):
+        """DRAG: tahan klik kiri di (x, y), tarik, lalu lepas."""
+        end_x, end_y = drag_destination(
+            x, y, step.get("drag", DRAG_LABELS[0]), bounds
+        )
+
+        self.set_status(
+            f"Tahap {step['number']}: drag dari ({x}, {y}) "
+            f"ke ({end_x}, {end_y})"
+        )
+
+        pyautogui.mouseDown(x, y, button="left")
+
+        try:
+            if not self.stop_event.wait(DRAG_HOLD_DELAY):
+                pyautogui.moveTo(
+                    end_x, end_y,
+                    duration=DRAG_DURATION,
+                    tween=pyautogui.easeInOutQuad
+                )
+
+                self.stop_event.wait(DRAG_RELEASE_DELAY)
+        finally:
+            # Klik kiri selalu dilepas, walau dihentikan di tengah jalan.
+            pyautogui.mouseUp(button="left")
+
+    def do_action(self, step, x, y, bounds=None):
         # Gerakkan mouse: cepat di awal, melambat dekat target.
         pyautogui.moveTo(
             x, y,
@@ -1886,12 +2648,21 @@ class AutoKlikDeteksiLayar(wx.Frame):
         if self.stop_event.wait(BEFORE_CLICK_DELAY):
             return
 
-        if step["method"] == "KLIK GANDA":
+        method = step["method"]
+
+        if method == "KLIK GANDA":
             pyautogui.doubleClick(x, y)
+        elif method == "KLIK KANAN":
+            pyautogui.rightClick(x, y)
+        elif method == DRAG_METHOD:
+            if bounds is None:
+                bounds = (x, y, x, y)
+
+            self.do_drag(step, x, y, bounds)
         else:
             pyautogui.click(x, y)
 
-        if step["method"] == "KETIK":
+        if method == "KETIK":
             if self.stop_event.wait(BEFORE_TYPE_DELAY):
                 return
 
@@ -1926,11 +2697,14 @@ class AutoKlikDeteksiLayar(wx.Frame):
 
         return True
 
-    def scroll_until_found(self, step, screen, monitor):
+    def scroll_until_found(self, step, screen, monitor, deadline=None):
         """
         SCROLL: jika kata tidak ada di layar, scroll pelan ke bawah
         sampai mentok. Jika belum ketemu, scroll ke atas sampai mentok.
-        Diulang sampai kata ditemukan atau dihentikan.
+        Diulang sampai kata ditemukan, dihentikan, atau melewati batas
+        waktu (mode daftar).
+
+        Mengembalikan: "found", "stop", atau "fail".
         """
         keyword = step["keyword"]
         number = step["number"]
@@ -1956,7 +2730,10 @@ class AutoKlikDeteksiLayar(wx.Frame):
                 self.set_status(
                     f"Tahap {number}: {keyword} ditemukan"
                 )
-                return True
+                return "found"
+
+            if self.past_deadline(deadline):
+                return "fail"
 
             # Arahkan mouse ke tengah layar agar scroll
             # mengenai jendela yang sedang tampil.
@@ -1972,7 +2749,10 @@ class AutoKlikDeteksiLayar(wx.Frame):
 
                 for _ in range(SCROLL_MAX_STEPS):
                     if self.stop_event.is_set():
-                        return False
+                        return "stop"
+
+                    if self.past_deadline(deadline):
+                        return "fail"
 
                     self.set_status(
                         f"Tahap {number}: scroll ke {label}, "
@@ -1982,7 +2762,7 @@ class AutoKlikDeteksiLayar(wx.Frame):
                     pyautogui.scroll(direction * SCROLL_CLICKS)
 
                     if self.stop_event.wait(SCROLL_DELAY):
-                        return False
+                        return "stop"
 
                     current = self.grab_image(screen, monitor)
 
@@ -1991,7 +2771,7 @@ class AutoKlikDeteksiLayar(wx.Frame):
                             f"Tahap {number}: "
                             f"{keyword} ditemukan"
                         )
-                        return True
+                        return "found"
 
                     # Layar tidak berubah = sudah mentok.
                     if self.images_similar(previous, current):
@@ -2012,44 +2792,60 @@ class AutoKlikDeteksiLayar(wx.Frame):
             )
 
             if self.stop_event.wait(SCAN_INTERVAL):
-                return False
+                return "stop"
 
-        return False
+        return "stop"
 
     # ==================================================
     # PROSES UTAMA
     # ==================================================
 
-    def run_step(self, step, screen, monitor):
-        """Jalankan satu tahap."""
+    def run_step(self, step, screen, monitor, list_mode=False):
+        """
+        Jalankan satu tahap.
+        Mengembalikan: "ok", "stop" (dihentikan), atau "fail"
+        (melewati batas tunggu, hanya di mode daftar).
+        """
 
         # ---------- DELAY (menunggu sebelum tahap dijalankan) ----------
         if not self.wait_delay(step):
-            return
+            return "stop"
+
+        # Batas tunggu hanya berlaku di mode daftar.
+        limit = step.get("timeout", 0) if list_mode else 0
+        deadline = (
+            time.monotonic() + limit if limit > 0 else None
+        )
 
         # ---------- LANGSUNG KETIK ----------
         if step["method"] == "LANGSUNG KETIK":
             done = self.type_directly(step)
 
-            if done and not self.stop_event.is_set():
-                self.stop_event.wait(STEP_DELAY)
+            if not done or self.stop_event.is_set():
+                return "stop"
 
-            return
+            self.stop_event.wait(STEP_DELAY)
+
+            return "stop" if self.stop_event.is_set() else "ok"
 
         # ---------- SCROLL ----------
         if step["method"] == "SCROLL":
-            found = self.scroll_until_found(step, screen, monitor)
+            result = self.scroll_until_found(
+                step, screen, monitor, deadline
+            )
 
-            if found and not self.stop_event.is_set():
-                self.press_enter_if_needed(step)
+            if result != "found":
+                return result
 
-                self.set_status(
-                    f"Tahap {step['number']} selesai"
-                )
+            self.press_enter_if_needed(step)
 
-                self.stop_event.wait(STEP_DELAY)
+            self.set_status(
+                f"Tahap {step['number']} selesai"
+            )
 
-            return
+            self.stop_event.wait(STEP_DELAY)
+
+            return "stop" if self.stop_event.is_set() else "ok"
 
         # ---------- DETEKSI (TULISAN / GAMBAR) LALU AKSI ----------
         name = self.target_name(step)
@@ -2058,7 +2854,6 @@ class AutoKlikDeteksiLayar(wx.Frame):
             f"Tahap {step['number']}: mencari {name}"
         )
 
-        found = False
         first_scan = True
 
         while not self.stop_event.is_set():
@@ -2071,6 +2866,13 @@ class AutoKlikDeteksiLayar(wx.Frame):
             position = self.find_target(step, image)
 
             if position is None:
+                if self.past_deadline(deadline):
+                    self.set_status(
+                        f"Tahap {step['number']}: {name} "
+                        f"tidak ditemukan (batas waktu)"
+                    )
+                    return "fail"
+
                 self.stop_event.wait(SCAN_INTERVAL)
                 continue
 
@@ -2092,20 +2894,110 @@ class AutoKlikDeteksiLayar(wx.Frame):
             if self.stop_event.wait(FOUND_DELAY):
                 break
 
-            self.do_action(step, x, y)
+            bounds = self.bounds_for_point(screen, monitor, x, y)
+            self.do_action(step, x, y, bounds)
 
             self.set_status(
                 f"Tahap {step['number']} selesai"
             )
 
-            found = True
-            break
-
-        if found and not self.stop_event.is_set():
             # Beri waktu aplikasi target memperbarui layar.
             self.stop_event.wait(STEP_DELAY)
 
-    def process_screen(self, steps, repeat):
+            return "stop" if self.stop_event.is_set() else "ok"
+
+        return "stop"
+
+    def process_list(self, steps, plan, screen, monitor):
+        """
+        MODE DAFTAR: satu putaran per baris file. Berhenti di baris
+        terakhir (Putar Ulang diabaikan). Mengembalikan
+        (berhasil, gagal, total, selesai_semua).
+        """
+        total = plan["count"]
+        primary = plan["order"][0]
+
+        success = 0
+        failed = 0
+        finished = True
+
+        self.skip_all = False
+
+        for index in range(total):
+            if self.stop_event.is_set():
+                finished = False
+                break
+
+            values = {
+                token: lines[index]
+                for token, lines in plan["data"].items()
+            }
+
+            # Nama di log = isi file daftar pertama yang dipakai.
+            name = values[primary]
+
+            self.set_status(f"Data ke-{index + 1}/{total}: {name}")
+
+            failed_step = None
+
+            for step in steps:
+                if self.stop_event.is_set():
+                    break
+
+                rendered = dict(step)
+                rendered["keyword"] = render_template(
+                    step["keyword"], values
+                )
+                rendered["typing"] = render_template(
+                    step["typing"], values
+                )
+
+                result = self.run_step(
+                    rendered, screen, monitor, list_mode=True
+                )
+
+                if result == "stop":
+                    break
+
+                if result == "fail":
+                    failed_step = rendered
+                    break
+
+            if self.stop_event.is_set():
+                finished = False
+                break
+
+            if failed_step is None:
+                success += 1
+                continue
+
+            # ----- tahap gagal: catat, lalu tanya (atau lewati) -----
+            failed += 1
+
+            message = failed_step["fail_msg"] or DEFAULT_FAIL_MSG
+
+            self.write_log(name, message)
+
+            if ESC_AFTER_FAIL:
+                pyautogui.press("esc")
+
+            if self.skip_all:
+                self.set_status(
+                    f"{name}: {message} (dilewati, dicatat di log)"
+                )
+                continue
+
+            decision = self.ask_failure(
+                name, failed_step["number"], message
+            )
+
+            if decision == "stop":
+                finished = False
+                break
+
+        return success, failed, total, finished
+
+    def process_screen(self, steps, repeat, plan=None):
         try:
             with mss.mss() as screen:
                 # monitors[0] adalah gabungan seluruh monitor.
@@ -2114,6 +3006,35 @@ class AutoKlikDeteksiLayar(wx.Frame):
                 # Tunggu jendela selesai ter-minimize.
                 self.stop_event.wait(MINIMIZE_DELAY)
 
+                # Sesi log baru tiap JALANKAN.
+                self.log_count = 0
+                self.log_header_written = False
+
+                # ---------- MODE DAFTAR ----------
+                if plan is not None:
+                    success, failed, total, finished = self.process_list(
+                        steps, plan, screen, monitor
+                    )
+
+                    if self.stop_event.is_set() or not finished:
+                        self.set_status(
+                            f"Proses dihentikan "
+                            f"({success} berhasil, {failed} gagal "
+                            f"dari {total} data)"
+                        )
+                    elif failed:
+                        self.set_status(
+                            f"Selesai: {success} berhasil, "
+                            f"{failed} gagal (lihat Data-Log.txt)"
+                        )
+                    else:
+                        self.set_status(
+                            f"Selesai: semua {total} data berhasil"
+                        )
+
+                    return
+
+                # ---------- MODE BIASA ----------
                 round_number = 1
 
                 while not self.stop_event.is_set():
@@ -2171,7 +3092,9 @@ class AutoKlikDeteksiLayar(wx.Frame):
             wx.CallAfter(self.btn_run.Enable)
             wx.CallAfter(self.btn_add.Enable)
             wx.CallAfter(self.btn_config.Enable)
+            wx.CallAfter(self.btn_reset.Enable)
             wx.CallAfter(self.btn_stop.Disable)
+            wx.CallAfter(self.update_f10_hotkey)
             wx.CallAfter(self.restore_window)
 
     def restore_window(self):
@@ -2192,6 +3115,9 @@ class AutoKlikDeteksiLayar(wx.Frame):
     def on_close(self, event):
         self.stop_event.set()
 
+        # Tutup popup gagal jika masih terbuka.
+        self.close_fail_dialog()
+
         # Tutup layar screenshot jika masih terbuka.
         if self.overlay is not None:
             try:
@@ -2209,6 +3135,14 @@ class AutoKlikDeteksiLayar(wx.Frame):
             self.UnregisterHotKey(self.HOTKEY_ID)
         except Exception:
             pass
+
+        if self.f10_registered:
+            try:
+                self.UnregisterHotKey(self.HOTKEY_F10_ID)
+            except Exception:
+                pass
+
+            self.f10_registered = False
 
         self.Destroy()
 
