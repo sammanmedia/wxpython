@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Auto List Pasien dari PDF  (v16)
+Auto List Pasien dari PDF  (v17)
 Database : AutopasienPDF.db (SQLite, bisa dibuka pakai DBeaver)
 Library  : wxPython, pymupdf, openpyxl, rapidocr-onnxruntime (OCR)
            pip install wxPython pymupdf openpyxl rapidocr-onnxruntime
@@ -13,6 +13,7 @@ import shutil
 import sqlite3
 import sys
 import threading
+import time
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -63,6 +64,10 @@ OCR_LOCK = threading.Lock()
 _OCR = {"engine": None}
 
 
+class Cancelled(Exception):
+    """Dilempar saat user menekan BATAL PROSES (dipakai untuk menghentikan scan seketika)."""
+
+
 def get_app_dir():
     """Folder aplikasi: folder .exe kalau sudah di-convert, folder script kalau jalan biasa."""
     if getattr(sys, "frozen", False):
@@ -70,7 +75,7 @@ def get_app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
-APP_TITLE = "Auto List Pasien dari pdf v16"
+APP_TITLE = "Auto List Pasien dari pdf v17"
 DB_NAME = "AutopasienPDF.db"
 BASE_DIR = get_app_dir()
 DEFAULT_DB = os.path.join(BASE_DIR, DB_NAME)
@@ -157,25 +162,36 @@ def month_number(word):
     return MONTH_MAP[close[0]] if close else None
 
 
-# ------------------------------------------------------ simpan pilihan database
-def load_last_db():
-    """Ambil database terakhir yang dipilih user (kalau file-nya masih ada)."""
+# ------------------------------------------------------ simpan pengaturan
+def load_config():
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            path = json.load(f).get("db_path", "")
-        if path and os.path.isfile(path):
-            return path
+            cfg = json.load(f)
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_config(**kw):
+    cfg = load_config()
+    cfg.update(kw)
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+def load_last_db():
+    """Ambil database terakhir yang dipilih user (kalau file-nya masih ada)."""
+    path = load_config().get("db_path", "")
+    if path and os.path.isfile(path):
+        return path
     return DEFAULT_DB
 
 
 def save_last_db(path):
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump({"db_path": path}, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    save_config(db_path=path)
 
 
 # ------------------------------------------------------------------------ OCR
@@ -245,10 +261,11 @@ LABEL_START_RE = re.compile(
 
 
 class PdfDoc:
-    def __init__(self, path):
+    def __init__(self, path, stop=None):
         self.doc = None
         self.reader = None
         self.ocr_used = False
+        self.stop = stop  # threading.Event, kalau di-set -> proses dihentikan
         if fitz:
             self.doc = fitz.open(path)
             self.count = self.doc.page_count
@@ -260,7 +277,12 @@ class PdfDoc:
         self._cache = {}
         self._ocr_cache = {}
 
+    def check(self):
+        if self.stop is not None and self.stop.is_set():
+            raise Cancelled()
+
     def text(self, i):
+        self.check()
         if i in self._cache:
             return self._cache[i]
         try:
@@ -279,6 +301,7 @@ class PdfDoc:
 
     def ocr_text(self, i):
         """Render halaman jadi gambar lalu baca dengan OCR (hasil disimpan sementara)."""
+        self.check()
         if i in self._ocr_cache:
             return self._ocr_cache[i]
         t = ""
@@ -488,13 +511,14 @@ def extract_doctor(pdf, allow_ocr=True):
     return ""
 
 
-def extract_patient(path, db):
+def extract_patient(path, db, stop=None):
     """
     Baca satu PDF. Return (data, existing).
     existing = baris yang sudah ada di database (atau None).
     OCR hanya dijalankan kalau datanya memang belum ada di database.
+    Kalau stop di-set, proses berhenti dengan melempar Cancelled.
     """
-    pdf = PdfDoc(path)
+    pdf = PdfDoc(path, stop)
     try:
         if pdf.count == 0:
             return None, None
@@ -744,7 +768,21 @@ class Database:
         self.conn.execute("DELETE FROM pasien WHERE id=?", (pid,))
         self.conn.commit()
 
-    # ---------------- gabung database (v16)
+    def delete_many(self, ids):
+        """Hapus banyak data sekaligus (dipecah per 500 supaya aman)."""
+        ids = [int(i) for i in ids]
+        try:
+            for k in range(0, len(ids), 500):
+                chunk = ids[k:k + 500]
+                self.conn.execute(
+                    f"DELETE FROM pasien WHERE id IN ({','.join('?' * len(chunk))})", chunk
+                )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    # ---------------- gabung database
     def backup_to(self, dest_path):
         """Backup database ini ke file lain (memakai fitur backup resmi SQLite)."""
         self.conn.commit()
@@ -949,11 +987,94 @@ class EditDialog(wx.Dialog):
         return out
 
 
+# ------------------------------------------------- Dialog pilih banyak folder
+class MultiFolderDialog(wx.Dialog):
+    """Pilih banyak folder sekaligus: Ctrl+klik (terpisah) atau Shift+klik (blok berurutan)."""
+
+    def __init__(self, parent, start_dir=""):
+        super().__init__(
+            parent, title="Pilih Folder PDF (boleh banyak)", size=(640, 620),
+            style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
+        )
+        self.extra = []  # folder tambahan dari tombol "+ Folder lain..."
+
+        style = wx.DIRCTRL_DIR_ONLY | getattr(wx, "DIRCTRL_MULTIPLE", 0)
+        kw = {}
+        if start_dir and os.path.isdir(start_dir):
+            kw["dir"] = start_dir
+        self.tree = wx.GenericDirCtrl(self, style=style, **kw)
+
+        info = wx.StaticText(
+            self,
+            label=(
+                "Ctrl + klik   : pilih beberapa folder terpisah\n"
+                "Shift + klik  : pilih blok folder berurutan\n"
+                "Subfolder di dalam folder terpilih otomatis ikut di-scan."
+            ),
+        )
+        self.lbl_extra = wx.StaticText(self, label="")
+        btn_extra = wx.Button(self, label="+ Folder lain...")
+        btn_extra.Bind(wx.EVT_BUTTON, self.on_add_extra)
+
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(btn_extra, 0, wx.RIGHT, 10)
+        row.Add(self.lbl_extra, 1, wx.ALIGN_CENTER_VERTICAL)
+
+        main = wx.BoxSizer(wx.VERTICAL)
+        main.Add(info, 0, wx.ALL, 10)
+        main.Add(self.tree, 1, wx.LEFT | wx.RIGHT | wx.EXPAND, 10)
+        main.Add(row, 0, wx.ALL | wx.EXPAND, 10)
+        main.Add(self.CreateStdDialogButtonSizer(wx.OK | wx.CANCEL), 0, wx.ALL | wx.ALIGN_RIGHT, 10)
+        self.SetSizer(main)
+        self.Bind(wx.EVT_BUTTON, self.on_ok, id=wx.ID_OK)
+        self.CentreOnParent()
+
+    def on_add_extra(self, _):
+        dlg = wx.DirDialog(self, "Pilih folder tambahan", style=wx.DD_DEFAULT_STYLE)
+        if dlg.ShowModal() == wx.ID_OK:
+            p = dlg.GetPath()
+            if p and p not in self.extra:
+                self.extra.append(p)
+            self.lbl_extra.SetLabel(f"Folder tambahan: {len(self.extra)}")
+            self.Layout()
+        dlg.Destroy()
+
+    def get_paths(self):
+        paths = []
+        try:
+            paths = list(self.tree.GetPaths())
+        except Exception:
+            paths = []
+        if not paths:
+            try:
+                tc = self.tree.GetTreeCtrl()
+                for it in tc.GetSelections():
+                    paths.append(self.tree.GetPath(it))
+            except Exception:
+                pass
+        if not paths:
+            try:
+                p = self.tree.GetPath()
+                if p:
+                    paths = [p]
+            except Exception:
+                pass
+        paths += self.extra
+        return [p for p in dict.fromkeys(paths) if p and os.path.isdir(p)]
+
+    def on_ok(self, e):
+        if not self.get_paths():
+            wx.MessageBox("Pilih minimal satu folder dulu.", "Pilih Folder",
+                          wx.OK | wx.ICON_INFORMATION)
+            return
+        e.Skip()
+
+
 # ---------------------------------------------------------------- Main Frame
 class MainFrame(wx.Frame):
     def __init__(self):
         super().__init__(None, title=APP_TITLE, size=(1350, 720))
-        self.cancel = False
+        self.stop = threading.Event()  # tombol BATAL PROSES -> stop.set()
         self.worker = None
         self.sort_col = None   # index kolom yang sedang di-sort
         self.sort_asc = True
@@ -1004,7 +1125,7 @@ class MainFrame(wx.Frame):
 
         self.btn_cancel = wx.Button(p, label="BATALKAN PROSES")
         self.btn_cancel.Disable()
-        self.btn_cancel.Bind(wx.EVT_BUTTON, lambda e: setattr(self, "cancel", True))
+        self.btn_cancel.Bind(wx.EVT_BUTTON, self.on_cancel)
         s.Add(self.btn_cancel, 0, wx.LEFT | wx.RIGHT | wx.TOP | wx.EXPAND, 12)
 
         self.lbl_folder = wx.StaticText(p, label="Folder: -", style=wx.ST_ELLIPSIZE_MIDDLE)
@@ -1040,7 +1161,7 @@ class MainFrame(wx.Frame):
         self.btn_export.SetBackgroundColour(wx.Colour(33, 115, 70))
         self.btn_export.SetForegroundColour(wx.Colour(255, 255, 255))
         self.txt_search = wx.TextCtrl(p, size=(300, -1))
-        self.txt_search.SetHint("Ketik untuk mencari (nama / no. peserta / SEP / telp / dokter...)")
+        self.txt_search.SetHint("Cari: nama / no. peserta / SEP / telp / dokter...")
         self.lbl_total = wx.StaticText(p, label="Total: 0")
 
         for b in (self.btn_db, self.btn_merge, self.btn_edit, self.btn_del, self.btn_ref, self.btn_export):
@@ -1056,6 +1177,7 @@ class MainFrame(wx.Frame):
             self.grid.SetColSize(i, COL_WIDTH.get(key, 120))
         self.grid.SetRowLabelSize(0)
         self.grid.EnableEditing(False)
+        # mode pilih baris; Ctrl+klik / Shift+klik / drag = pilih banyak baris
         self.grid.SetSelectionMode(getattr(gridlib.Grid, "GridSelectRows", getattr(gridlib.Grid, "SelectRows", 1)))
 
         # ---- tinggi baris dikunci: kursor tidak berubah jadi panah atas-bawah,
@@ -1114,9 +1236,41 @@ class MainFrame(wx.Frame):
         self.grid.Bind(gridlib.EVT_GRID_CELL_LEFT_DCLICK, self.on_cell_dclick)
         self.grid.Bind(gridlib.EVT_GRID_LABEL_LEFT_CLICK, self.on_header_click)
         self.grid.Bind(gridlib.EVT_GRID_ROW_SIZE, lambda e: e.Veto())  # cadangan: tolak resize baris
+        self.grid.Bind(wx.EVT_KEY_DOWN, self.on_grid_key_down)  # DELETE, Backspace, Esc
+        self.grid.Bind(wx.EVT_CHAR, self.on_grid_char)          # ketik langsung -> kolom pencarian
 
         p.SetSizer(s)
         return p
+
+    # ---------------- keyboard di tabel (v17)
+    def on_grid_key_down(self, e):
+        code = e.GetKeyCode()
+        if code in (wx.WXK_DELETE, wx.WXK_NUMPAD_DELETE):
+            self.delete_selected(use_cursor=False)
+            return
+        if code == wx.WXK_BACK and not (e.ControlDown() or e.AltDown()):
+            cur = self.txt_search.GetValue()
+            if cur:
+                self.txt_search.SetValue(cur[:-1])
+                self.txt_search.SetInsertionPointEnd()
+                return
+        if code == wx.WXK_ESCAPE and self.txt_search.GetValue():
+            self.txt_search.SetValue("")
+            return
+        e.Skip()
+
+    def on_grid_char(self, e):
+        # Ctrl+huruf / Alt+huruf dibiarkan (AltGr = Ctrl+Alt tetap dianggap mengetik)
+        if e.ControlDown() != e.AltDown():
+            e.Skip()
+            return
+        ch = e.GetUnicodeKey()
+        if ch and ch >= 32 and ch != 127:
+            self.txt_search.SetFocus()
+            self.txt_search.AppendText(chr(ch))
+            self.txt_search.SetInsertionPointEnd()
+            return
+        e.Skip()
 
     # ---------------- pencarian langsung
     def on_search_text(self, _):
@@ -1188,18 +1342,41 @@ class MainFrame(wx.Frame):
         self.lbl_total.SetLabel(f"Total: {len(rows)}")
         self.right.Layout()
 
-    def selected_id(self):
+    def selected_rows(self, use_cursor=True):
+        """Nomor baris (index tabel) yang sedang diseleksi, mendukung multi seleksi."""
         g = self.grid
-        rows = g.GetSelectedRows()
-        row = rows[0] if rows else g.GetGridCursorRow()
-        if row is None or row < 0 or row >= g.GetNumberRows():
-            return None
+        rows = set(g.GetSelectedRows())
         try:
-            return int(g.GetCellValue(row, 0))
-        except ValueError:
-            return None
+            tls = g.GetSelectionBlockTopLeft()
+            brs = g.GetSelectionBlockBottomRight()
+            for tl, br in zip(tls, brs):
+                rows.update(range(tl.GetRow(), br.GetRow() + 1))
+        except Exception:
+            pass
+        if not rows and use_cursor:
+            r = g.GetGridCursorRow()
+            if r is not None and 0 <= r < g.GetNumberRows():
+                rows.add(r)
+        return sorted(r for r in rows if 0 <= r < g.GetNumberRows())
+
+    def selected_ids(self, use_cursor=True):
+        ids = []
+        for r in self.selected_rows(use_cursor):
+            try:
+                ids.append(int(self.grid.GetCellValue(r, 0)))
+            except ValueError:
+                pass
+        return ids
+
+    def selected_id(self):
+        ids = self.selected_ids(True)
+        return ids[0] if ids else None
 
     def on_cell_click(self, e):
+        # Ctrl / Shift + klik = memilih banyak baris, jangan jalankan aksi tombol
+        if e.ShiftDown() or e.ControlDown():
+            e.Skip()
+            return
         row, col = e.GetRow(), e.GetCol()
         if 0 <= col < len(GRID_COLS):
             key = GRID_COLS[col][0]
@@ -1364,7 +1541,7 @@ class MainFrame(wx.Frame):
             self.progress.set(0, f"Database dibuka: {total} data")
         dlg.Destroy()
 
-    # ---------------- gabung database (v16)
+    # ---------------- gabung database
     def on_merge_db(self, _):
         """Gabungkan satu atau banyak file .db ke database yang sedang dibuka."""
         if self.worker and self.worker.is_alive():
@@ -1496,115 +1673,210 @@ class MainFrame(wx.Frame):
             return
         self.edit_by_id(pid)
 
-    def on_delete(self, _):
-        pid = self.selected_id()
-        if pid is None:
-            wx.MessageBox("Klik salah satu data di list dulu.", "Hapus", wx.OK | wx.ICON_INFORMATION)
+    # ---------------- hapus (satu / banyak data)
+    def delete_selected(self, use_cursor=True):
+        ids = self.selected_ids(use_cursor)
+        if not ids:
+            wx.MessageBox("Klik / seleksi data di list dulu.", "Hapus", wx.OK | wx.ICON_INFORMATION)
             return
-        if wx.MessageBox("Yakin hapus data ini?", "Konfirmasi", wx.YES_NO | wx.ICON_QUESTION) == wx.YES:
-            self.db.delete(pid)
-            self.refresh_grid()
+        if len(ids) == 1:
+            row = self.db.get(ids[0])
+            nama = row_get(row, "nama_peserta") if row else ""
+            sep = row_get(row, "no_SEP") if row else ""
+            text = f"Hapus data ini?\n\n{nama}\nNO SEP: {sep}"
+        else:
+            text = f"Hapus {len(ids)} data yang dipilih?"
+        dlg = wx.MessageDialog(self, text, "Konfirmasi Hapus",
+                               wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION)
+        try:
+            dlg.SetYesNoLabels("Ya", "Tidak")
+        except Exception:
+            pass
+        ok = dlg.ShowModal() == wx.ID_YES
+        dlg.Destroy()
+        if not ok:
+            return
+        try:
+            self.db.delete_many(ids)
+        except Exception as ex:
+            wx.MessageBox(f"Gagal menghapus:\n{ex}", "Hapus", wx.OK | wx.ICON_ERROR)
+            return
+        self.refresh_grid()
+        self.progress.set(self.progress.value, f"{len(ids)} data dihapus")
+
+    def on_delete(self, _):
+        self.delete_selected(use_cursor=True)
 
     # ---------------- scan folder
+    def post(self, fn, *args):
+        """Kirim hasil dari thread kerja ke tampilan (aman kalau jendela sudah ditutup)."""
+        try:
+            wx.CallAfter(fn, *args)
+        except Exception:
+            pass
+
     def on_pick_folder(self, _):
         if self.worker and self.worker.is_alive():
             return
-        dlg = wx.DirDialog(self, "Pilih folder PDF (termasuk subfolder)", style=wx.DD_DEFAULT_STYLE)
-        if dlg.ShowModal() == wx.ID_OK:
-            folder = dlg.GetPath()
-            self.lbl_folder.SetLabel(f"Folder: {folder}")
-            self.lbl_folder.SetToolTip(folder)
-            self.log.Clear()
-            if not OCR_AVAILABLE:
-                self.log.AppendText(
-                    "[INFO] OCR belum terpasang, halaman hasil scan tidak bisa dibaca.\n"
-                    "       Jalankan di CMD: pip install rapidocr-onnxruntime\n\n"
-                )
-            self.cancel = False
-            self.btn_folder.Disable()
-            self.btn_merge.Disable()
-            self.btn_cancel.Enable()
-            self.progress.set(0, "Memulai...")
-            self.worker = threading.Thread(target=self.scan_worker, args=(folder,), daemon=True)
-            self.worker.start()
+        dlg = MultiFolderDialog(self, load_config().get("last_folder", ""))
+        if dlg.ShowModal() != wx.ID_OK:
+            dlg.Destroy()
+            return
+        folders = dlg.get_paths()
         dlg.Destroy()
-
-    def scan_worker(self, folder):
-        db = Database(self.db_path)  # koneksi sendiri untuk thread ini
-        files = []
-        for root, _, names in os.walk(folder):
-            for n in names:
-                if n.lower().endswith(".pdf"):
-                    files.append(os.path.join(root, n))
-        files.sort()
-        total = len(files)
-        baru = upd = dup = gagal = 0
-
-        if total == 0:
-            wx.CallAfter(self.on_done, 0, 0, 0, 0, "Tidak ada file PDF.")
-            db.close()
+        if not folders:
             return
 
-        fill_fields = [("no_telepon", "telp"), ("control_ulang", "kontrol"), ("dokter", "dokter")]
+        save_config(last_folder=folders[0])
+        if len(folders) == 1:
+            self.lbl_folder.SetLabel(f"Folder: {folders[0]}")
+        else:
+            self.lbl_folder.SetLabel(f"{len(folders)} folder dipilih")
+        self.lbl_folder.SetToolTip("\n".join(folders))
 
-        for i, path in enumerate(files, 1):
-            if self.cancel:
-                break
-            name = os.path.basename(path)
-            try:
-                data, existing = extract_patient(path, db)
-                if not data or not (data["nama_peserta"] or data["no_peserta"] or data["no_SEP"]):
-                    gagal += 1
-                    msg = f"[GAGAL] {name} - data tidak ditemukan"
-                else:
-                    tag = " [OCR]" if data.get("_ocr") else ""
-                    if existing is None:
-                        db.insert(data)
-                        baru += 1
-                        msg = (
-                            f"[BARU ] {name} - {data['nama_peserta']} | "
-                            f"telp: {data['no_telepon'] or '-'} | "
-                            f"kontrol: {data['control_ulang'] or '-'} | "
-                            f"dokter: {data['dokter'] or '-'}{tag}"
-                        )
+        self.log.Clear()
+        self.log.AppendText("Folder yang di-scan:\n" + "\n".join("  - " + f for f in folders) + "\n\n")
+        if not OCR_AVAILABLE:
+            self.log.AppendText(
+                "[INFO] OCR belum terpasang, halaman hasil scan tidak bisa dibaca.\n"
+                "       Jalankan di CMD: pip install rapidocr-onnxruntime\n\n"
+            )
+        self.stop.clear()
+        self.btn_folder.Disable()
+        self.btn_merge.Disable()
+        self.btn_cancel.Enable()
+        self.progress.set(0, "Memulai...")
+        self.worker = threading.Thread(target=self.scan_worker, args=(folders,), daemon=True)
+        self.worker.start()
+
+    def on_cancel(self, _):
+        """BATAL PROSES: langsung bereaksi, thread kerja berhenti di titik cek terdekat."""
+        if self.worker and self.worker.is_alive() and not self.stop.is_set():
+            self.stop.set()
+            self.btn_cancel.Disable()
+            self.progress.set(self.progress.value, "Membatalkan...")
+            self.log.AppendText("[INFO] Pembatalan diminta, berhenti sebentar lagi...\n")
+
+    def scan_worker(self, folders):
+        db = None
+        baru = upd = dup = gagal = 0
+        processed = 0
+        total = 0
+        try:
+            db = Database(self.db_path)  # koneksi sendiri untuk thread ini
+
+            # kumpulkan semua PDF dari semua folder (file yang sama tidak dobel)
+            found = {}
+            for folder in folders:
+                for root, _, names in os.walk(folder):
+                    if self.stop.is_set():
+                        break
+                    for n in names:
+                        if n.lower().endswith(".pdf"):
+                            full = os.path.join(root, n)
+                            found.setdefault(os.path.normcase(os.path.abspath(full)), full)
+                if self.stop.is_set():
+                    break
+            files = sorted(found.values())
+            total = len(files)
+
+            if self.stop.is_set():
+                self.post(self.on_done, 0, 0, 0, 0, "Dibatalkan")
+                return
+            if total == 0:
+                self.post(self.on_done, 0, 0, 0, 0, "Tidak ada file PDF.")
+                return
+
+            self.post(self.on_progress, 0, total, 0, 0, 0, 0, f"Ditemukan {total} file PDF.", False)
+
+            fill_fields = [("no_telepon", "telp"), ("control_ulang", "kontrol"), ("dokter", "dokter")]
+            buf = []
+            last_flush = time.time()
+            last_refresh = time.time()
+
+            for i, path in enumerate(files, 1):
+                if self.stop.is_set():
+                    break
+                name = os.path.basename(path)
+                try:
+                    data, existing = extract_patient(path, db, self.stop)
+                    if not data or not (data["nama_peserta"] or data["no_peserta"] or data["no_SEP"]):
+                        gagal += 1
+                        msg = f"[GAGAL] {name} - data tidak ditemukan"
                     else:
-                        # isi data yang masih kosong di database.
-                        # khusus DOKTER: kalau beda dengan isi PDF halaman 2, ditimpa (koreksi data lama)
-                        fields = {}
-                        notes = []
-                        for key, lab in fill_fields:
-                            old = str(row_get(existing, key)).strip()
-                            new = str(data.get(key) or "").strip()
-                            if not new:
-                                continue
-                            if key == "dokter":
-                                if new != old:
+                        tag = " [OCR]" if data.get("_ocr") else ""
+                        if existing is None:
+                            db.insert(data)
+                            baru += 1
+                            msg = (
+                                f"[BARU ] {name} - {data['nama_peserta']} | "
+                                f"telp: {data['no_telepon'] or '-'} | "
+                                f"kontrol: {data['control_ulang'] or '-'} | "
+                                f"dokter: {data['dokter'] or '-'}{tag}"
+                            )
+                        else:
+                            # isi data yang masih kosong di database.
+                            # khusus DOKTER: kalau beda dengan isi PDF halaman 2, ditimpa (koreksi data lama)
+                            fields = {}
+                            notes = []
+                            for key, lab in fill_fields:
+                                old = str(row_get(existing, key)).strip()
+                                new = str(data.get(key) or "").strip()
+                                if not new:
+                                    continue
+                                if key == "dokter":
+                                    if new != old:
+                                        fields[key] = new
+                                        notes.append(f"{lab}: {new}")
+                                elif not old:
                                     fields[key] = new
                                     notes.append(f"{lab}: {new}")
-                            elif not old:
-                                fields[key] = new
-                                notes.append(f"{lab}: {new}")
-                        if fields:
-                            db.update_fields(existing["id"], fields)
-                            upd += 1
-                            msg = f"[UPDATE] {name} - diisi {', '.join(notes)}{tag}"
-                        else:
-                            dup += 1
-                            msg = f"[SKIP ] {name} - sudah ada ({data['nama_peserta']}){tag}"
-            except Exception as ex:
-                gagal += 1
-                msg = f"[ERROR] {name} - {ex}"
-            wx.CallAfter(self.on_progress, i, total, baru, upd, dup, gagal, msg)
+                            if fields:
+                                db.update_fields(existing["id"], fields)
+                                upd += 1
+                                msg = f"[UPDATE] {name} - diisi {', '.join(notes)}{tag}"
+                            else:
+                                dup += 1
+                                msg = f"[SKIP ] {name} - sudah ada ({data['nama_peserta']}){tag}"
+                except Cancelled:
+                    break
+                except Exception as ex:
+                    gagal += 1
+                    msg = f"[ERROR] {name} - {ex}"
 
-        db.close()
-        status = "Dibatalkan" if self.cancel else "Selesai"
-        wx.CallAfter(self.on_done, baru, upd, dup, gagal, status)
+                processed = i
+                buf.append(msg)
+                now = time.time()
+                if now - last_flush >= 0.2 or i == total:
+                    refresh = (now - last_refresh) >= 3.0
+                    if refresh:
+                        last_refresh = now
+                    self.post(self.on_progress, i, total, baru, upd, dup, gagal, "\n".join(buf), refresh)
+                    buf = []
+                    last_flush = now
 
-    def on_progress(self, i, total, baru, upd, dup, gagal, msg):
-        self.progress.set(i * 100.0 / total, f"Memproses {i}/{total}")
+            if buf:  # sisa log yang belum terkirim (misal karena dibatalkan)
+                self.post(self.on_progress, processed, total, baru, upd, dup, gagal, "\n".join(buf), False)
+
+            status = "Dibatalkan" if self.stop.is_set() else "Selesai"
+            self.post(self.on_done, baru, upd, dup, gagal, status)
+        except Exception as ex:
+            self.post(self.on_progress, processed, max(total, 1), baru, upd, dup, gagal,
+                      f"[ERROR] Scan berhenti: {ex}", False)
+            self.post(self.on_done, baru, upd, dup, gagal, "Berhenti (error)")
+        finally:
+            if db is not None:
+                db.close()
+
+    def on_progress(self, i, total, baru, upd, dup, gagal, text, refresh):
+        if self.stop.is_set():
+            self.progress.set(i * 100.0 / total if total else 0, "Membatalkan...")
+        else:
+            self.progress.set(i * 100.0 / total if total else 0, f"Memproses {i}/{total}")
         self.lbl_stat.SetLabel(self.stat_text(baru, upd, dup, gagal))
-        self.log.AppendText(msg + "\n")
-        if i % 25 == 0:
+        if text:
+            self.log.AppendText(text + "\n")
+        if refresh:
             self.refresh_grid()
 
     def on_done(self, baru, upd, dup, gagal, status):
@@ -1620,9 +1892,11 @@ class MainFrame(wx.Frame):
         self.refresh_grid()
 
     def on_close(self, e):
-        self.cancel = True
+        self.stop.set()
         if self.search_timer is not None:
             self.search_timer.Stop()
+        if self.worker and self.worker.is_alive():
+            self.worker.join(timeout=2)  # beri waktu singkat agar thread berhenti rapi
         self.db.close()
         e.Skip()
 
