@@ -1,5 +1,5 @@
 """
-MikroTik Dashboard v4 (wxPython + librouteros)
+MikroTik Dashboard v5 (wxPython + librouteros)
 
 Install:
     pip install wxPython librouteros keyring
@@ -7,7 +7,7 @@ Install:
 Alur:
     1. Dialog Login : host, username, password, [x] Ingat saya
     2. Dialog Port  : port API (default 8728) -> baru konek
-    3. Dashboard    : info device + tombol [USERNAME KELUAR]
+    3. Dashboard    : info device + tombol [USER HOTSPOT] (ijo) + [USERNAME KELUAR] (merah)
         Baris 1 : Sort by (+ input refresh queue)
         Baris 2 : List Queue     (atas 70%)  - sort, bar usage, double-click = grafik
         Baris 3 : List Interface (bawah 30%) - status JALAN (ijo) / MATI (merah),
@@ -20,6 +20,13 @@ Alur:
                   - internet mati / link putus -> RX & TX merah NAIK FULL
 
     Teks baris queue: >=100% merah bold, >=70% oranye bold, selain itu hitam biasa.
+
+    [USER HOTSPOT] -> jendela baru (NEW di v5):
+        ATAS  : User Sudah Login Hotspot, N Perangkat   (/ip/hotspot/active)
+        BAWAH : User Belum Login Hotspot, N Perangkat   (/ip/hotspot/host, authorized=false)
+        Kolom : No | Username | IP | MAC | Uptime | Upload | Download | Total Upload | Total Download
+        Double-click perangkat -> grafik Download & Upload (seperti halaman utama).
+        Data hotspot hanya diambil saat jendela ini terbuka.
 """
 import json
 import math
@@ -74,6 +81,10 @@ WAN_PING_HOST = "8.8.8.8"    # tujuan ping untuk cek internet
 WAN_DOWN_COLOR = wx.Colour(225, 40, 40)
 VGRID_COLOR = wx.Colour(205, 205, 205)
 
+# ---- User Hotspot
+HOTSPOT_INTERVAL = 2             # detik, refresh data hotspot (hanya saat jendelanya terbuka)
+HOTSPOT_INCLUDE_BYPASSED = False # True = host "bypassed" ikut tampil di daftar "belum login"
+
 # ---- warna list belang
 ROW_WHITE = wx.Colour(255, 255, 255)
 ROW_GREY = wx.Colour(240, 242, 245)
@@ -126,6 +137,19 @@ def to_int(v):
         return int(v)
     except (TypeError, ValueError):
         return 0
+
+
+def is_true(v):
+    """Nilai boolean dari RouterOS API (bisa bool Python atau string 'true'/'yes')."""
+    return v is True or str(v).strip().lower() in ("true", "yes")
+
+
+def ip_sort_key(ip):
+    """Urutkan IP secara numerik (192.168.88.2 < 192.168.88.10)."""
+    try:
+        return tuple(int(p) for p in str(ip).split("."))
+    except ValueError:
+        return (999, 999, 999, 999)
 
 
 def parse_rate(s):
@@ -249,7 +273,7 @@ class PortDialog(wx.Dialog):
 
 # ---------------------------------------------------------------- list belang (custom draw)
 class _RowBox(wx.VListBox):
-    """Daftar baris yang digambar manual: belang, bar usage, seleksi per-nama."""
+    """Daftar baris yang digambar manual: belang, bar usage, seleksi per-kunci."""
 
     def __init__(self, parent, owner):
         super().__init__(parent, style=wx.BORDER_NONE)
@@ -264,7 +288,8 @@ class _RowBox(wx.VListBox):
 
     def OnDrawBackground(self, dc, rect, n):
         o = self.owner
-        if o.selected is not None and n < len(o.rows) and o.rows[n][0] == o.selected:
+        if (o.selected is not None and n < len(o.rows)
+                and o.rows[n][o.key_index] == o.selected):
             color = ROW_SELECTED
         else:
             color = ROW_WHITE if n % 2 == 0 else ROW_GREY
@@ -331,17 +356,22 @@ class _RowBox(wx.VListBox):
 class StripedList(wx.Panel):
     """Header + daftar belang. columns = [(judul, bobot_lebar, lebar_min, 'text'|'bar')].
     pct_index  = posisi nilai usage% di dalam tuple baris (untuk warna teks baris).
-    cell_style = fungsi (row, index_kolom) -> wx.Colour / None (warna teks per-sel)."""
+    cell_style = fungsi (row, index_kolom) -> wx.Colour / None (warna teks per-sel).
+    key_index  = posisi nilai 'kunci' baris di tuple (dipakai untuk seleksi & double-click).
+                 Default 0 (kolom pertama); list hotspot pakai kolom MAC karena kolom 'No'
+                 berubah-ubah."""
 
     ROW_H = 24
     HEAD_H = 26
 
-    def __init__(self, parent, columns, on_activate=None, pct_index=None, cell_style=None):
+    def __init__(self, parent, columns, on_activate=None, pct_index=None,
+                 cell_style=None, key_index=0):
         super().__init__(parent)
         self.columns = columns
         self.on_activate = on_activate
         self.pct_index = pct_index
         self.cell_style = cell_style
+        self.key_index = key_index
         self.rows = []
         self.selected = None
 
@@ -390,13 +420,13 @@ class StripedList(wx.Panel):
     def on_select(self, evt):
         n = evt.GetSelection()
         if 0 <= n < len(self.rows):
-            self.selected = self.rows[n][0]
+            self.selected = self.rows[n][self.key_index]
         self.body.RefreshAll()
 
     def on_dclick(self, evt):
         n = evt.GetSelection()
         if 0 <= n < len(self.rows) and self.on_activate:
-            self.on_activate(self.rows[n][0])
+            self.on_activate(self.rows[n][self.key_index])
 
     def on_paint_header(self, _evt):
         dc = wx.AutoBufferedPaintDC(self.header)
@@ -544,6 +574,169 @@ class BandwidthGraphFrame(wx.Frame):
         self.rx.set_data(rx)
 
 
+# ---------------------------------------------------------------- jendela User Hotspot
+HS_COLS = [
+    ("No", 0.5, 45, "text"),
+    ("Username", 2.0, 120, "text"),
+    ("IP Address", 1.6, 110, "text"),
+    ("MAC Address", 1.8, 130, "text"),
+    ("Uptime", 1.4, 90, "text"),
+    ("Upload", 1.4, 95, "text"),
+    ("Download", 1.4, 95, "text"),
+    ("Total Upload", 1.5, 100, "text"),
+    ("Total Download", 1.5, 105, "text"),
+]
+HS_KEY_INDEX = 3        # kolom MAC dipakai sebagai kunci perangkat
+
+
+def hs_cell_color(row, ci):
+    """Upload (ijo) & Download (biru), konsisten dengan halaman utama."""
+    if ci in (5, 7):
+        return COLOR_UL
+    if ci in (6, 8):
+        return COLOR_DL
+    return None
+
+
+class HotspotFrame(wx.Frame):
+    """ATAS = user sudah login hotspot, BAWAH = belum login.
+    Double-click perangkat -> grafik Download & Upload."""
+
+    def __init__(self, dash):
+        super().__init__(dash, title="User Hotspot", size=(1080, 660))
+        self.dash = dash
+        self.history = {}     # {mac: {"down": deque, "up": deque}}
+        self.info = {}        # {mac: (username, ip)}
+        self.graphs = {}      # {mac: BandwidthGraphFrame}
+
+        root = wx.Panel(self)
+        bold = root.GetFont()
+        bold.SetWeight(wx.FONTWEIGHT_BOLD)
+
+        self.splitter = wx.SplitterWindow(root, style=wx.SP_LIVE_UPDATE | wx.SP_3D)
+        self.splitter.SetMinimumPaneSize(80)
+        self.splitter.SetSashGravity(0.5)
+
+        # ---- BAGIAN ATAS: sudah login
+        top_panel = wx.Panel(self.splitter)
+        self.lbl_active = wx.StaticText(top_panel, label="User Sudah Login Hotspot, memuat data...")
+        self.lbl_active.SetFont(bold)
+        self.lst_active = StripedList(top_panel, HS_COLS, on_activate=self.open_graph,
+                                      cell_style=hs_cell_color, key_index=HS_KEY_INDEX)
+        tbox = wx.BoxSizer(wx.VERTICAL)
+        tbox.Add(self.lbl_active, 0, wx.ALL, 6)
+        tbox.Add(self.lst_active, 1, wx.EXPAND)
+        top_panel.SetSizer(tbox)
+
+        # ---- BAGIAN BAWAH: belum login
+        bot_panel = wx.Panel(self.splitter)
+        self.lbl_unauth = wx.StaticText(bot_panel, label="User Belum Login Hotspot, memuat data...")
+        self.lbl_unauth.SetFont(bold)
+        self.lst_unauth = StripedList(bot_panel, HS_COLS, on_activate=self.open_graph,
+                                      cell_style=hs_cell_color, key_index=HS_KEY_INDEX)
+        bbox = wx.BoxSizer(wx.VERTICAL)
+        bbox.Add(self.lbl_unauth, 0, wx.ALL, 6)
+        bbox.Add(self.lst_unauth, 1, wx.EXPAND)
+        bot_panel.SetSizer(bbox)
+
+        self.splitter.SplitHorizontally(top_panel, bot_panel, 300)
+
+        rbox = wx.BoxSizer(wx.VERTICAL)
+        rbox.Add(self.splitter, 1, wx.EXPAND)
+        root.SetSizer(rbox)
+
+        self.CreateStatusBar()
+        self.SetStatusText(f"Refresh tiap {HOTSPOT_INTERVAL} detik  |  Double-click perangkat untuk grafik")
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+        wx.CallAfter(self.set_split)
+
+    def set_split(self):
+        h = self.splitter.GetClientSize().height
+        self.splitter.SetSashPosition(int(h * 0.5))
+
+    # ------------------------------------------------ data
+    def _push(self, mac, down, up):
+        h = self.history.setdefault(mac, {"down": deque(maxlen=HISTORY_MAX),
+                                          "up": deque(maxlen=HISTORY_MAX)})
+        h["down"].append(down)
+        h["up"].append(up)
+
+    def _build(self, items):
+        """items: (user, ip, mac, uptime, up_bps, down_bps, bytes_in, bytes_out)."""
+        rows = []
+        for i, (user, ip, mac, uptime, up, down, b_in, b_out) in enumerate(items, 1):
+            self._push(mac, down, up)
+            self.info[mac] = (user, ip)
+            rows.append((i, user, ip, mac, uptime,
+                         fmt_bps(up), fmt_bps(down),
+                         fmt_bytes(b_in), fmt_bytes(b_out)))
+        return rows
+
+    def update_data(self, data):
+        if "error" in data:
+            self.lbl_active.SetLabel(f"Data hotspot tidak bisa dibaca: {data['error']}")
+            self.lbl_active.SetForegroundColour(WAN_DOWN_COLOR)
+            self.lbl_active.Refresh()
+            self.lbl_unauth.SetLabel("User Belum Login Hotspot, 0 Perangkat")
+            self.lst_active.set_rows([])
+            self.lst_unauth.set_rows([])
+            return
+
+        active, unauth = data["active"], data["unauth"]
+        self.lbl_active.SetForegroundColour(wx.BLACK)
+        self.lbl_active.SetLabel(f"User Sudah Login Hotspot, {len(active)} Perangkat")
+        self.lbl_unauth.SetLabel(f"User Belum Login Hotspot, {len(unauth)} Perangkat")
+
+        self.lst_active.set_rows(self._build(active))
+        self.lst_unauth.set_rows(self._build(unauth))
+
+        # buang riwayat perangkat yang sudah tidak ada
+        macs = {r[2] for r in active} | {r[2] for r in unauth}
+        for gone in [m for m in self.history if m not in macs]:
+            del self.history[gone]
+
+        # refresh grafik yang sedang terbuka
+        for mac, win in self.graphs.items():
+            h = self.history.get(mac)
+            if h:
+                win.refresh_data(h["down"], h["up"])
+
+    # ------------------------------------------------ double-click -> grafik
+    def open_graph(self, mac):
+        if mac in self.graphs:
+            self.graphs[mac].Raise()
+            return
+        user, ip = self.info.get(mac, ("-", ""))
+        name = user if user not in ("", "-") else ip
+        win = BandwidthGraphFrame(self, f"Hotspot <{name}>  {ip}", "Download", "Upload")
+        win.Bind(wx.EVT_CLOSE, lambda e, k=mac, w=win: self.on_graph_close(k, w))
+        h = self.history.get(mac)
+        if h:
+            win.refresh_data(h["down"], h["up"])
+        self.graphs[mac] = win
+        win.Show()
+
+    def on_graph_close(self, mac, win):
+        self.graphs.pop(mac, None)
+        win.Destroy()
+
+    # ------------------------------------------------ tutup
+    def _destroy_graphs(self):
+        for w in list(self.graphs.values()):
+            w.Destroy()
+        self.graphs.clear()
+
+    def on_close(self, _evt):
+        self._destroy_graphs()
+        self.dash.hs_closed()
+        self.Destroy()
+
+    def shutdown(self):
+        """Dipanggil Dashboard saat aplikasi ditutup."""
+        self._destroy_graphs()
+        self.Destroy()
+
+
 # ---------------------------------------------------------------- dashboard
 # Urutan kolom = urutan nilai di tuple baris (lihat render_queue)
 QUEUE_COLS = [
@@ -597,6 +790,11 @@ class Dashboard(wx.Frame):
         self.graphs = {}          # {(jenis, nama): BandwidthGraphFrame}
         self.queue_rows = []      # (name, target, limit_text, tx, rx, pct, total_down, total_up)
 
+        # ---- state User Hotspot
+        self.hs_frame = None      # jendela User Hotspot (None = tertutup)
+        self.hs_open = False      # dibaca thread polling: ambil data hotspot hanya saat True
+        self.hs_prev = {}         # {(jenis, mac): (waktu, bytes_in, bytes_out)} - hanya thread polling
+
         # ---- state Interface WAN (dibaca juga oleh thread polling)
         self.wan_on = WAN_DEFAULT_ON
         self.wan_num = WAN_DEFAULT_ETHER
@@ -608,7 +806,7 @@ class Dashboard(wx.Frame):
 
         self.root = root = wx.Panel(self)
 
-        # ---------- bar atas: info device + tombol [USERNAME KELUAR]
+        # ---------- bar atas: info device + tombol [USER HOTSPOT] + [USERNAME KELUAR]
         top = wx.Panel(root)
         top.SetBackgroundColour(BAR_BG)
         bold = top.GetFont()
@@ -619,6 +817,13 @@ class Dashboard(wx.Frame):
         self.lbl_cpu = wx.StaticText(top, label="CPU : -")
         for lb in (self.lbl_dev, self.lbl_ram, self.lbl_use, self.lbl_cpu):
             lb.SetFont(bold)
+
+        self.btn_hotspot = GenButton(top, label="USER HOTSPOT", size=(-1, 34))
+        self.btn_hotspot.SetMinSize((140, 34))
+        self.btn_hotspot.SetBackgroundColour(wx.Colour(40, 160, 70))
+        self.btn_hotspot.SetForegroundColour(wx.WHITE)
+        self.btn_hotspot.SetFont(bold)
+        self.btn_hotspot.Bind(wx.EVT_BUTTON, self.on_hotspot)
 
         self.btn_exit = GenButton(top, label=f"{(user or 'USER').upper()} KELUAR", size=(-1, 34))
         self.btn_exit.SetMinSize((130, 34))
@@ -631,6 +836,7 @@ class Dashboard(wx.Frame):
         for lb in (self.lbl_dev, self.lbl_ram, self.lbl_use, self.lbl_cpu):
             trow.Add(lb, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 28)
         trow.AddStretchSpacer(1)
+        trow.Add(self.btn_hotspot, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
         trow.Add(self.btn_exit, 0, wx.ALIGN_CENTER_VERTICAL)
         tbox = wx.BoxSizer(wx.VERTICAL)
         tbox.Add(trow, 1, wx.EXPAND | wx.ALL, 10)
@@ -768,6 +974,24 @@ class Dashboard(wx.Frame):
     def on_q_interval(self, _evt):
         self.q_interval = max(1, self.spin_q.GetValue())
 
+    # ------------------------------------------------ User Hotspot: buka / tutup jendela
+    def on_hotspot(self, _evt):
+        if self.hs_frame is not None:
+            self.hs_frame.Raise()
+            return
+        self.hs_frame = HotspotFrame(self)
+        self.hs_open = True            # setelah frame ada -> thread polling mulai ambil data
+        self.hs_frame.Show()
+
+    def hs_closed(self):
+        """Dipanggil HotspotFrame saat ditutup user."""
+        self.hs_open = False
+        self.hs_frame = None
+
+    def update_hotspot(self, data):
+        if self.running and self.hs_frame is not None:
+            self.hs_frame.update_data(data)
+
     # ------------------------------------------------ Interface WAN: kontrol
     def style_wan_button(self):
         if self.wan_on:
@@ -838,10 +1062,57 @@ class Dashboard(wx.Frame):
         received = max((to_int(r.get("received")) for r in rows), default=0)
         return received > 0
 
+    # ------------------------------------------------ ambil data hotspot (thread polling)
+    def fetch_hotspot(self, now):
+        """-> {"active": [...], "unauth": [...]}
+        Tiap item: (user, ip, mac, uptime, up_bps, down_bps, bytes_in, bytes_out)
+        Upload = bytes-in (dari perangkat ke router), Download = bytes-out (ke perangkat).
+        Laju (bps) dihitung dari selisih byte antar-refresh."""
+        active_raw = list(self.api.path("ip", "hotspot", "active"))
+        hosts_raw = list(self.api.path("ip", "hotspot", "host"))
+
+        new_prev = {}
+
+        def calc(key, b_in, b_out):
+            new_prev[key] = (now, b_in, b_out)
+            p = self.hs_prev.get(key)
+            if not p:
+                return 0.0, 0.0
+            dt = max(now - p[0], 0.001)
+            return (max(b_in - p[1], 0) * 8 / dt,
+                    max(b_out - p[2], 0) * 8 / dt)
+
+        active = []
+        for a in active_raw:
+            mac = a.get("mac-address", "")
+            ip = a.get("address", "")
+            b_in, b_out = to_int(a.get("bytes-in")), to_int(a.get("bytes-out"))
+            up, down = calc(("a", mac), b_in, b_out)
+            active.append((a.get("user") or "-", ip, mac, str(a.get("uptime", "")),
+                           up, down, b_in, b_out))
+        active.sort(key=lambda r: r[0].lower())
+
+        unauth = []
+        for h in hosts_raw:
+            if is_true(h.get("authorized")):
+                continue                              # sudah login -> ada di daftar atas
+            if is_true(h.get("bypassed")) and not HOTSPOT_INCLUDE_BYPASSED:
+                continue
+            mac = h.get("mac-address", "")
+            ip = h.get("address") or h.get("to-address", "")
+            b_in, b_out = to_int(h.get("bytes-in")), to_int(h.get("bytes-out"))
+            up, down = calc(("h", mac), b_in, b_out)
+            unauth.append(("-", ip, mac, str(h.get("uptime", "")), up, down, b_in, b_out))
+        unauth.sort(key=lambda r: ip_sort_key(r[1]))
+
+        self.hs_prev = new_prev
+        return {"active": active, "unauth": unauth}
+
     # ------------------------------------------------ thread polling
     def poll(self):
         last_q = 0.0
         last_wan = 0.0
+        last_hs = 0.0
         wan_prev = None            # (waktu, rx_byte, tx_byte)
         wan_gen_seen = self.wan_gen
         while self.running:
@@ -939,7 +1210,24 @@ class Dashboard(wx.Frame):
                     wan_gen_seen = self.wan_gen
                     wan_prev = None
 
+                # User Hotspot: hanya diambil saat jendelanya terbuka.
+                # Error (mis. paket hotspot tidak ada) dilaporkan ke jendela, tidak
+                # mengganggu update halaman utama.
+                hs_data = None
+                if self.hs_open:
+                    if now - last_hs >= HOTSPOT_INTERVAL:
+                        last_hs = now
+                        try:
+                            hs_data = self.fetch_hotspot(now)
+                        except Exception as e:
+                            hs_data = {"error": str(e)}
+                else:
+                    self.hs_prev = {}          # buka lagi = hitung laju dari nol
+                    last_hs = 0.0
+
                 wx.CallAfter(self.update_ui, sysinfo, if_rows, q_rows, wan_sample)
+                if hs_data is not None:
+                    wx.CallAfter(self.update_hotspot, hs_data)
             except Exception as e:
                 wx.CallAfter(self.SetStatusText, f"Error: {e}")
             time.sleep(1)
@@ -1059,6 +1347,10 @@ class Dashboard(wx.Frame):
 
     def on_close(self, _evt):
         self.running = False
+        self.hs_open = False
+        if self.hs_frame is not None:
+            self.hs_frame.shutdown()
+            self.hs_frame = None
         for w in list(self.graphs.values()):
             w.Destroy()
         self.graphs.clear()
