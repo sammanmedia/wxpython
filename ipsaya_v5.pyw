@@ -4,17 +4,26 @@ Aplikasi Info IP Saya + Network Tools (wxPython)
 KIRI  : IP publik beserta kota, negara, region, ISP, zona waktu,
         mata uang, koordinat, status proxy/hosting, dan bendera negara.
 KANAN : Form input IP / alamat web + tombol
-            [PING] [TRACERT] [PORT] [IP SCANNER] [SPEEDTEST]
-            [                  STOP                        ]
+            [PING] [TRACERT] [PORT] [IP SCANNER] [SPEEDTEST] [HTTP CHECKER] [QR GENERATOR]
+            [                           STOP                                ]
         + grafik batang ping (ms) ala Winbox + statistik (avg/max/min/loss/time).
-        PORT       : scan port TCP 1-65535 pada IP / host yang diinput.
-        IP SCANNER : wajib rentang IP, mis. 192.168.1.1-192.168.1.254
-        SPEEDTEST  : ping, download, upload dengan gauge berjarum ala speedtest.net
-                     (satuan bisa dipilih: Mbps atau MB/s lewat radio button).
-                     Server tes: speed.cloudflare.com (tanpa instalasi tambahan).
+        PORT         : scan port TCP 1-65535 pada IP / host yang diinput.
+        IP SCANNER   : wajib rentang IP, mis. 192.168.1.1-192.168.1.254
+        SPEEDTEST    : ping, download, upload dengan gauge berjarum ala speedtest.net
+                       (satuan bisa dipilih: Mbps atau MB/s lewat radio button).
+                       Server tes: speed.cloudflare.com (tanpa instalasi tambahan).
+        QR GENERATOR : isi teks / URL di kolom input, klik tombol -> QR muncul,
+                       klik SIMPAN untuk menyimpan sebagai gambar PNG.
 
-Instalasi : pip install wxPython
-Jalankan  : python ip_info_app.py
+V5 (baru):
+        TOGGLE PANEL KIRI : tombol tipis di tengah (◀ / ▶) untuk menyembunyikan / menampilkan sisi kiri.
+        SERVER SPEEDTEST LAN (kiri bawah) : [START SERVER] [STOP SERVER] [PORT]
+                       Klien LAN buka http://IP-KOMPUTER:PORT di browser -> halaman Speedtest LAN.
+                       Bandwidth bar UPLOAD SERVER / DOWNLOAD SERVER tampil live ala Winbox.
+                       (UPLOAD = klien upload ke server, DOWNLOAD = klien download dari server)
+
+Instalasi : pip install wxPython qrcode
+Jalankan  : python ipsaya.pyw
 
 Sumber data: ip-api.com (gratis untuk penggunaan non-komersial, HTTP saja)
 Bendera    : flagcdn.com
@@ -25,6 +34,7 @@ import io
 import ipaddress
 import json
 import math
+import os
 import platform
 import re
 import shutil
@@ -37,6 +47,7 @@ import urllib.error
 import webbrowser
 import urllib.parse
 from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import wx
@@ -61,6 +72,8 @@ TIMEOUT_RE = re.compile(
 GREEN = wx.Colour(46, 160, 67)
 RED = wx.Colour(200, 40, 40)
 GREY = wx.Colour(160, 160, 160)
+BLUE = wx.Colour(30, 110, 220)
+PURPLE = wx.Colour(120, 70, 200)
 
 # ---- pengaturan speedtest ----
 SPEED_HOST = "speed.cloudflare.com"
@@ -75,7 +88,7 @@ HTTP_UA = "IPInfoApp/1.0 HTTP Checker"
 
 def make_button(parent, label, color):
     """Tombol berwarna (GenButton supaya warna konsisten di semua OS)."""
-    btn = GenButton(parent, label=label, size=(90, 34))
+    btn = GenButton(parent, label=label, size=(60, 34))
     btn.SetUseFocusIndicator(False)
     btn.SetForegroundColour(wx.WHITE)
     btn.SetBackgroundColour(color)
@@ -83,6 +96,15 @@ def make_button(parent, label, color):
     f.SetWeight(wx.FONTWEIGHT_BOLD)
     btn.SetFont(f)
     return btn
+
+
+def fmt_elapsed(secs):
+    """Format lama waktu. Di bawah 1 jam: '5 menit : 9 detik'.
+    Mulai 60 menit: '1 jam 0 menit 9 detik'."""
+    secs = int(secs)
+    if secs >= 3600:
+        return f"{secs // 3600} jam {(secs % 3600) // 60} menit {secs % 60} detik"
+    return f"{secs // 60} menit : {secs % 60} detik"
 
 
 def build_command(mode, target):
@@ -241,6 +263,75 @@ def normalize_http_url(value):
     if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
         raise ValueError("URL tidak valid. Contoh: https://example.com")
     return value
+
+
+def build_qr_matrix(text):
+    """Bikin matriks QR (list of list bool) memakai library 'qrcode'.
+    Raise ImportError kalau library belum terpasang."""
+    import qrcode
+    qr = qrcode.QRCode(
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=1,
+        border=0,
+    )
+    qr.add_data(text)
+    qr.make(fit=True)
+    return qr.get_matrix()
+
+
+class QRPanel(wx.Panel):
+    """Menampilkan gambar QR code (digambar sendiri dari matriks, tanpa PIL)."""
+
+    QUIET = 4   # zona tenang (jumlah modul putih di sekeliling QR)
+
+    def __init__(self, parent, height=260):
+        super().__init__(parent, size=(-1, height))
+        self.SetMinSize((100, height))
+        self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self.matrix = None
+        self.Bind(wx.EVT_PAINT, self.on_paint)
+        self.Bind(wx.EVT_SIZE, lambda e: (self.Refresh(), e.Skip()))
+
+    def set_matrix(self, matrix):
+        self.matrix = matrix
+        self.Refresh()
+
+    def _draw_modules(self, dc, ox, oy, mod):
+        dc.SetPen(wx.TRANSPARENT_PEN)
+        dc.SetBrush(wx.Brush(wx.BLACK))
+        q = self.QUIET
+        for r, row in enumerate(self.matrix):
+            for c, val in enumerate(row):
+                if val:
+                    dc.DrawRectangle(ox + (c + q) * mod, oy + (r + q) * mod, mod, mod)
+
+    def on_paint(self, _evt):
+        dc = wx.AutoBufferedPaintDC(self)
+        dc.SetBackground(wx.Brush(self.GetParent().GetBackgroundColour()))
+        dc.Clear()
+        w, h = self.GetClientSize()
+        if not self.matrix:
+            return
+        n = len(self.matrix) + 2 * self.QUIET
+        mod = max(1, min(w, h) // n)
+        side = mod * n
+        ox, oy = (w - side) // 2, (h - side) // 2
+        dc.SetPen(wx.Pen(wx.Colour(210, 214, 222)))
+        dc.SetBrush(wx.Brush(wx.WHITE))
+        dc.DrawRectangle(ox, oy, side, side)
+        self._draw_modules(dc, ox, oy, mod)
+
+    def to_bitmap(self, module_px=12):
+        """Render QR ke wx.Bitmap beresolusi tinggi (untuk disimpan)."""
+        n = len(self.matrix) + 2 * self.QUIET
+        side = n * module_px
+        bmp = wx.Bitmap(side, side)
+        mdc = wx.MemoryDC(bmp)
+        mdc.SetBackground(wx.Brush(wx.WHITE))
+        mdc.Clear()
+        self._draw_modules(mdc, 0, 0, module_px)
+        mdc.SelectObject(wx.NullBitmap)
+        return bmp
 
 
 class PingGraph(wx.Panel):
@@ -563,8 +654,7 @@ class PingStats:
     def elapsed_text(self):
         if self.t0 is None:
             return "--"
-        secs = int((self.t_end or time.monotonic()) - self.t0)
-        return f"{secs // 60} menit : {secs % 60} detik"
+        return fmt_elapsed((self.t_end or time.monotonic()) - self.t0)
 
 
 class ScanStats:
@@ -581,23 +671,24 @@ class ScanStats:
         return self.done / self.total * 100 if self.total else 0
 
     def elapsed_text(self):
-        secs = int((self.t_end or time.monotonic()) - self.t0)
-        return f"{secs // 60} menit : {secs % 60} detik"
+        return fmt_elapsed((self.t_end or time.monotonic()) - self.t0)
 
 
 class StatsBar(wx.Panel):
-    """Teks statistik tebal (2 baris) di samping angka ms. Mendukung warna per bagian."""
+    """Teks statistik tebal (1-2 baris), rata tengah. Mendukung warna per bagian.
+    Ukuran huruf mengecil otomatis kalau teks tidak muat dalam satu baris."""
 
     DARK = wx.Colour(30, 35, 45)
     SEP = wx.Colour(150, 158, 172)
+    SIZES = (10, 9, 8, 7)
 
     def __init__(self, parent):
         super().__init__(parent)
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
-        self.font = wx.Font(10, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)
         self.lines = []
         self.SetMinSize((200, 48))
         self.Bind(wx.EVT_PAINT, self.on_paint)
+        self.Bind(wx.EVT_SIZE, lambda e: (self.Refresh(), e.Skip()))
 
     def set_lines(self, lines):
         self.lines = lines
@@ -607,13 +698,22 @@ class StatsBar(wx.Panel):
         dc = wx.AutoBufferedPaintDC(self)
         dc.SetBackground(wx.Brush(self.GetParent().GetBackgroundColour()))
         dc.Clear()
-        dc.SetFont(self.font)
+        w, h = self.GetClientSize()
+
+        # pilih ukuran huruf terbesar yang masih muat
+        for size in self.SIZES:
+            dc.SetFont(wx.Font(size, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
+            widest = max((sum(dc.GetTextExtent(t)[0] for t, _ in line) for line in self.lines), default=0)
+            if widest <= w - 4:
+                break
+
         lh = dc.GetTextExtent("Ag")[1]
         gap = 4
         total_h = len(self.lines) * lh + max(0, len(self.lines) - 1) * gap
-        y = max(0, (self.GetClientSize().height - total_h) // 2)
+        y = max(0, (h - total_h) // 2)
         for line in self.lines:
-            x = 0
+            line_w = sum(dc.GetTextExtent(t)[0] for t, _ in line)
+            x = max(0, (w - line_w) // 2)
             for text, colour in line:
                 dc.SetTextForeground(colour)
                 dc.DrawText(text, x, y)
@@ -621,10 +721,540 @@ class StatsBar(wx.Panel):
             y += lh + gap
 
 
+# =====================================================================
+#  SERVER SPEEDTEST LAN (v5)
+#  Server HTTP kecil (stdlib saja). Client membuka http://IP:PORT di browser
+#  -> tampil halaman Speedtest LAN. Endpoint: / , /ping , /download , /upload
+# =====================================================================
+SERVER_DEFAULT_PORT = 6000
+SERVER_BLOCK = os.urandom(1 << 18)      # 256 KB data acak untuk tes download
+
+SPEEDTEST_HTML = r"""<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Speedtest LAN</title>
+<style>
+:root{--ink:#eef1fb;--dim:#8f9bc4;--card:#171f45;--line:#2a3566}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0}
+body{min-height:100vh;background:radial-gradient(ellipse at 50% -10%,#24338a 0,#0f1530 62%) fixed;color:var(--ink);font-family:"Segoe UI",system-ui,Roboto,Arial,sans-serif;display:flex;justify-content:center}
+.wrap{width:100%;max-width:560px;padding:20px 16px 32px;text-align:center}
+h1{margin:6px 0 0;font-size:26px;letter-spacing:3px;font-weight:800}
+h1 span{background:linear-gradient(90deg,#00bfff,#9650eb);-webkit-background-clip:text;background-clip:text;color:transparent}
+.sub{color:var(--dim);font-size:13px;margin:4px 0 14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:10px 8px 6px;box-shadow:0 12px 40px rgba(0,0,0,.35)}
+.phase{font-size:13px;letter-spacing:3px;color:var(--dim);font-weight:700;padding-top:4px;min-height:22px}
+svg{width:100%;height:auto;max-width:420px;display:block;margin:0 auto}
+.res{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:14px 0}
+.res div{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 4px}
+.res small{display:block;color:var(--dim);font-size:11px;letter-spacing:1px}
+.res b{display:block;font-size:20px;margin-top:4px}
+.res i{font-style:normal;color:var(--dim);font-size:11px}
+#go{width:100%;border:0;border-radius:999px;padding:15px;font-size:17px;font-weight:800;letter-spacing:2px;color:#fff;background:linear-gradient(90deg,#00bfff,#9650eb);cursor:pointer}
+#go:disabled{opacity:.55;cursor:default}
+.units{margin-top:14px;color:var(--dim);font-size:13px}
+.units button{background:none;border:1px solid var(--line);color:var(--dim);border-radius:8px;padding:5px 12px;margin-left:6px;cursor:pointer}
+.units button.on{background:#2a3566;color:#fff}
+.msg{margin-top:12px;color:#ff8a8a;font-size:13px;min-height:18px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>SPEEDTEST <span>LAN</span></h1>
+  <div class="sub">Server: <b id="host"></b></div>
+
+  <div class="card">
+    <div class="phase" id="phase">SIAP</div>
+    <svg viewBox="0 0 300 250">
+      <defs>
+        <linearGradient id="g" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0" stop-color="#00bfff"/><stop offset="1" stop-color="#9650eb"/>
+        </linearGradient>
+      </defs>
+      <path id="track" fill="none" stroke="#303758" stroke-width="12"/>
+      <path id="prog" fill="none" stroke="url(#g)" stroke-width="12"/>
+      <g id="ticks" fill="#8f9bc4" font-size="10" text-anchor="middle"></g>
+      <g id="needle"><polygon points="230,150 150,145 150,155" fill="#ffffff"/></g>
+      <circle cx="150" cy="150" r="9" fill="#9650eb"/>
+      <text id="big" x="150" y="200" text-anchor="middle" font-size="38" font-weight="800" fill="#eef1fb">0.0</text>
+      <text id="unit" x="150" y="222" text-anchor="middle" font-size="13" fill="#8f9bc4">Mbps</text>
+    </svg>
+  </div>
+
+  <div class="res">
+    <div><small>PING</small><b id="r-ping">--</b><i>ms</i></div>
+    <div><small>JITTER</small><b id="r-jit">--</b><i>ms</i></div>
+    <div><small>DOWNLOAD</small><b id="r-down">--</b><i id="u-down">Mbps</i></div>
+    <div><small>UPLOAD</small><b id="r-up">--</b><i id="u-up">Mbps</i></div>
+  </div>
+
+  <button id="go">MULAI TES</button>
+  <div class="units">Satuan:
+    <button data-u="Mbps" class="on">Mbps</button><button data-u="MB/s">MB/s</button>
+  </div>
+  <div class="msg" id="msg"></div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var TIERS = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000];
+  var CX = 150, CY = 150, R = 118, A0 = 135, SW = 270;
+  var STREAMS = 6, DUR = 10000, WARM = 1000;
+  var NS = 'http://www.w3.org/2000/svg';
+  var unit = 'Mbps', maxv = 100, target = 0, shown = 0, running = false;
+  var bigText = null, blobCache = null;
+  var res = { ping: null, jitter: null, down: null, up: null };
+
+  function $(i) { return document.getElementById(i); }
+  function rad(d) { return d * Math.PI / 180; }
+  function pt(a, r) { return [CX + r * Math.cos(rad(a)), CY + r * Math.sin(rad(a))]; }
+  function conv(m) { return unit === 'MB/s' ? m / 8 : m; }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  // ---- gauge ----
+  var p0 = pt(A0, R), p1 = pt(A0 + SW, R);
+  var arc = 'M ' + p0[0] + ' ' + p0[1] + ' A ' + R + ' ' + R + ' 0 1 1 ' + p1[0] + ' ' + p1[1];
+  $('track').setAttribute('d', arc);
+  $('prog').setAttribute('d', arc);
+  var L = R * rad(SW);
+
+  function buildTicks() {
+    var g = $('ticks');
+    while (g.firstChild) g.removeChild(g.firstChild);
+    for (var i = 0; i <= 10; i++) {
+      var a = A0 + SW * i / 10, v = maxv * i / 10;
+      var a1 = pt(a, R - 10), a2 = pt(a, R - 16), tp = pt(a, R - 29);
+      var ln = document.createElementNS(NS, 'line');
+      ln.setAttribute('x1', a1[0]); ln.setAttribute('y1', a1[1]);
+      ln.setAttribute('x2', a2[0]); ln.setAttribute('y2', a2[1]);
+      ln.setAttribute('stroke', '#8f9bc4');
+      g.appendChild(ln);
+      var t = document.createElementNS(NS, 'text');
+      t.setAttribute('x', tp[0]); t.setAttribute('y', tp[1] + 3.5);
+      t.textContent = String(parseFloat(v.toFixed(1)));
+      g.appendChild(t);
+    }
+  }
+
+  function resetScale() {
+    maxv = unit === 'MB/s' ? 20 : 100;
+    $('unit').textContent = unit;
+    buildTicks();
+  }
+
+  function frame() {
+    shown += (target - shown) * 0.15;
+    if (Math.abs(target - shown) < 0.005) shown = target;
+    var v = conv(shown);
+    while (v > maxv * 0.98 && TIERS.indexOf(maxv) < TIERS.length - 1) {
+      maxv = TIERS[TIERS.indexOf(maxv) + 1];
+      buildTicks();
+    }
+    var f = Math.max(0, Math.min(v / maxv, 1));
+    $('prog').setAttribute('stroke-dasharray', (f * L) + ' ' + (L + 20));
+    $('needle').setAttribute('transform', 'rotate(' + (A0 + SW * f) + ' ' + CX + ' ' + CY + ')');
+    $('big').textContent = bigText === null ? v.toFixed(v < 10 ? 2 : 1) : bigText;
+    requestAnimationFrame(frame);
+  }
+
+  function setPhase(name) {
+    $('phase').textContent = name;
+    target = 0;
+  }
+
+  // ---- hasil ----
+  function fmtV(m) {
+    if (m === null) return '--';
+    var v = conv(m);
+    return v.toFixed(v < 10 ? 2 : 1);
+  }
+  function render() {
+    $('r-ping').textContent = res.ping === null ? '--' : res.ping.toFixed(1);
+    $('r-jit').textContent = res.jitter === null ? '--' : res.jitter.toFixed(1);
+    $('r-down').textContent = fmtV(res.down);
+    $('r-up').textContent = fmtV(res.up);
+    $('u-down').textContent = unit;
+    $('u-up').textContent = unit;
+  }
+
+  // ---- ping ----
+  async function measurePing() {
+    var t = [];
+    for (var i = 0; i < 12; i++) {
+      var s = performance.now();
+      var r = await fetch('/ping?r=' + Math.random(), { cache: 'no-store' });
+      await r.text();
+      t.push(performance.now() - s);
+      await sleep(60);
+    }
+    t.shift();                                   // buang sampel pertama (handshake)
+    var avg = t.reduce(function (a, b) { return a + b; }, 0) / t.length, j = 0;
+    for (var k = 1; k < t.length; k++) j += Math.abs(t[k] - t[k - 1]);
+    return [avg, t.length > 1 ? j / (t.length - 1) : 0];
+  }
+
+  // ---- download / upload ----
+  async function downWorker(st, ctrl) {
+    var errs = 0;
+    while (!st.stop) {
+      try {
+        var r = await fetch('/download?size=200000000&r=' + Math.random(), { cache: 'no-store', signal: ctrl.signal });
+        var rd = r.body.getReader();
+        while (!st.stop) {
+          var x = await rd.read();
+          if (x.done) break;
+          st.bytes += x.value.length;
+        }
+        try { await rd.cancel(); } catch (e) {}
+      } catch (e) {
+        if (st.stop || ++errs > 5) return;
+        await sleep(200);
+      }
+    }
+  }
+
+  function getBlob() {
+    if (!blobCache) {
+      var buf = new Uint8Array(8 * 1024 * 1024);
+      for (var i = 0; i < buf.length; i += 65536) crypto.getRandomValues(buf.subarray(i, i + 65536));
+      blobCache = new Blob([buf]);
+    }
+    return blobCache;
+  }
+
+  function upWorker(st, blob, xhrs) {
+    return new Promise(function (resolve) {
+      var errs = 0;
+      function next() {
+        if (st.stop) return resolve();
+        var x = new XMLHttpRequest(), last = 0;
+        xhrs.add(x);
+        x.open('POST', '/upload?r=' + Math.random());
+        x.upload.onprogress = function (e) { st.bytes += e.loaded - last; last = e.loaded; };
+        x.onload = function () { xhrs.delete(x); next(); };
+        x.onerror = function () {
+          xhrs.delete(x);
+          if (st.stop || ++errs > 5) return resolve();
+          setTimeout(next, 200);
+        };
+        x.onabort = function () { xhrs.delete(x); resolve(); };
+        x.send(blob);
+      }
+      next();
+    });
+  }
+
+  async function phaseRun(kind) {
+    var st = { bytes: 0, stop: false };
+    var ctrl = new AbortController();
+    var xhrs = new Set();
+    var workers = [];
+    var blob = kind === 'up' ? getBlob() : null;
+    for (var i = 0; i < STREAMS; i++) {
+      workers.push(kind === 'down' ? downWorker(st, ctrl) : upWorker(st, blob, xhrs));
+    }
+    var t0 = performance.now(), hist = [[t0, 0]], warm = null, end = null;
+    await new Promise(function (resolve) {
+      var iv = setInterval(function () {
+        var now = performance.now();
+        hist.push([now, st.bytes]);
+        while (hist.length > 2 && now - hist[0][0] > 1000) hist.shift();
+        var o = hist[0];
+        if (now > o[0]) target = (st.bytes - o[1]) * 8 / 1e6 / ((now - o[0]) / 1000);
+        if (!warm && now - t0 >= WARM) warm = [now, st.bytes];
+        if (now - t0 >= DUR) {
+          clearInterval(iv);
+          end = [now, st.bytes];
+          resolve();
+        }
+      }, 100);
+    });
+    st.stop = true;
+    ctrl.abort();
+    xhrs.forEach(function (x) { try { x.abort(); } catch (e) {} });
+    await Promise.all(workers);
+    if (end[1] === 0) throw new Error('tidak ada data yang diterima');
+    var w = warm || [t0, 0];
+    var span = (end[0] - w[0]) / 1000;
+    return span > 0 ? (end[1] - w[1]) * 8 / 1e6 / span : 0;
+  }
+
+  // ---- alur utama ----
+  async function start() {
+    if (running) return;
+    running = true;
+    var btn = $('go');
+    btn.disabled = true;
+    btn.textContent = 'MENGUKUR...';
+    $('msg').textContent = '';
+    res = { ping: null, jitter: null, down: null, up: null };
+    render();
+    try {
+      setPhase('PING'); bigText = '...'; resetScale();
+      var p = await measurePing();
+      res.ping = p[0]; res.jitter = p[1]; render();
+
+      bigText = null; setPhase('DOWNLOAD'); resetScale();
+      res.down = await phaseRun('down'); render();
+
+      target = 0; await sleep(800);
+      setPhase('UPLOAD'); resetScale();
+      res.up = await phaseRun('up'); render();
+
+      setPhase('SELESAI');
+      target = res.down;
+    } catch (e) {
+      bigText = null;
+      setPhase('GAGAL');
+      $('msg').textContent = 'Tes gagal: ' + (e && e.message ? e.message : e);
+    }
+    running = false;
+    btn.disabled = false;
+    btn.textContent = 'ULANGI TES';
+  }
+
+  $('host').textContent = location.host;
+  $('go').addEventListener('click', start);
+  var ub = document.querySelectorAll('.units button');
+  for (var i = 0; i < ub.length; i++) {
+    ub[i].addEventListener('click', function () {
+      unit = this.getAttribute('data-u');
+      for (var j = 0; j < ub.length; j++) ub[j].className = ub[j] === this ? 'on' : '';
+      if (!running) shown = target;
+      resetScale();
+      render();
+    });
+  }
+  resetScale();
+  render();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
+"""
+
+
+class _SpeedHttpd(ThreadingHTTPServer):
+    daemon_threads = True
+    block_on_close = False
+    allow_reuse_address = not IS_WINDOWS     # di Windows: biar bentrok port terdeteksi
+    request_queue_size = 128
+
+
+def make_speed_handler(srv):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = "IPSayaSpeedLAN/5.0"
+        timeout = 30
+
+        def log_message(self, *args):
+            pass
+
+        def _send(self, code, body, ctype):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            try:
+                u = urllib.parse.urlparse(self.path)
+                if u.path in ("/", "/index.html"):
+                    srv.log(f"[SERVER] {self.client_address[0]} membuka halaman Speedtest LAN")
+                    self._send(200, SPEEDTEST_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                elif u.path == "/ping":
+                    self._send(200, b"pong", "text/plain")
+                elif u.path == "/download":
+                    self._download(urllib.parse.parse_qs(u.query))
+                else:
+                    self._send(404, b"Not found", "text/plain")
+            except OSError:
+                self.close_connection = True
+
+        def _download(self, q):
+            try:
+                size = int(q.get("size", ["25000000"])[0])
+            except ValueError:
+                size = 25000000
+            size = max(0, min(size, 2000000000))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            view = memoryview(SERVER_BLOCK)
+            sent = 0
+            while sent < size and not srv.stopping.is_set():
+                n = min(len(SERVER_BLOCK), size - sent)
+                self.wfile.write(view[:n])
+                sent += n
+                srv.add_down(n)
+            if sent < size:
+                self.close_connection = True
+
+        def do_POST(self):
+            try:
+                u = urllib.parse.urlparse(self.path)
+                if u.path != "/upload":
+                    self.close_connection = True
+                    self._send(404, b"Not found", "text/plain")
+                    return
+                remaining = int(self.headers.get("Content-Length", "0") or 0)
+                while remaining > 0 and not srv.stopping.is_set():
+                    chunk = self.rfile.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    srv.add_up(len(chunk))
+                if remaining > 0:
+                    self.close_connection = True
+                    return
+                self._send(200, b"ok", "text/plain")
+            except (OSError, ValueError):
+                self.close_connection = True
+
+    return Handler
+
+
+class LanSpeedServer:
+    """Server speedtest LAN. Menghitung byte masuk (upload klien) dan keluar (download klien)."""
+
+    def __init__(self, port, on_log=None):
+        self.port = port
+        self.on_log = on_log
+        self.stopping = threading.Event()
+        self._lock = threading.Lock()
+        self._up = 0       # byte yang DITERIMA server (klien upload)
+        self._down = 0     # byte yang DIKIRIM server (klien download)
+        self._httpd = None
+        self._thread = None
+
+    def log(self, msg):
+        if self.on_log:
+            try:
+                self.on_log(msg)
+            except Exception:
+                pass
+
+    def add_up(self, n):
+        with self._lock:
+            self._up += n
+
+    def add_down(self, n):
+        with self._lock:
+            self._down += n
+
+    def counters(self):
+        with self._lock:
+            return self._up, self._down
+
+    def start(self):
+        """Raise OSError kalau port sudah dipakai."""
+        self._httpd = _SpeedHttpd(("0.0.0.0", self.port), make_speed_handler(self))
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever, kwargs={"poll_interval": 0.3}, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self.stopping.set()
+        if self._httpd is not None:
+            try:
+                self._httpd.shutdown()
+            except Exception:
+                pass
+            try:
+                self._httpd.server_close()
+            except Exception:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
+
+class BandwidthGraph(wx.Panel):
+    """Bandwidth bar ala Winbox jadul (batang bergeser ke kiri, batang baru di kanan).
+    Nilai dalam Mbps. Skala otomatis mengikuti puncak yang terlihat."""
+
+    BAR_W = 3
+    GAP = 1
+    STEPS = (1, 5, 10, 50, 100, 500, 1000, 5000, 10000)
+
+    def __init__(self, parent, title, color, height=84):
+        super().__init__(parent, size=(-1, height))
+        self.SetMinSize((100, height))
+        self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self.title = title
+        self.color = color
+        self.samples = deque(maxlen=1200)
+        self.Bind(wx.EVT_PAINT, self.on_paint)
+        self.Bind(wx.EVT_SIZE, lambda e: (self.Refresh(), e.Skip()))
+
+    def add(self, mbps):
+        self.samples.append(mbps)
+        self.Refresh()
+
+    def clear(self):
+        self.samples.clear()
+        self.Refresh()
+
+    def _scale(self, visible):
+        peak = max(visible, default=0)
+        for step in self.STEPS:
+            if peak <= step:
+                return step
+        return (int(peak) // 10000 + 1) * 10000
+
+    def on_paint(self, _evt):
+        dc = wx.AutoBufferedPaintDC(self)
+        w, h = self.GetClientSize()
+        dc.SetBackground(wx.Brush(wx.WHITE))
+        dc.Clear()
+
+        dc.SetPen(wx.Pen(wx.Colour(200, 205, 215)))
+        dc.SetBrush(wx.TRANSPARENT_BRUSH)
+        dc.DrawRectangle(0, 0, w, h)
+
+        dc.SetPen(wx.Pen(wx.Colour(228, 232, 238)))
+        for frac in (0.25, 0.5, 0.75):
+            y = int(h - 1 - frac * (h - 2))
+            dc.DrawLine(1, y, w - 1, y)
+
+        step = self.BAR_W + self.GAP
+        n = max(1, (w - 2) // step)
+        vis = list(self.samples)[-n:]
+        count = len(vis)
+        scale = self._scale(vis)
+
+        dc.SetPen(wx.TRANSPARENT_PEN)
+        dc.SetBrush(wx.Brush(self.color))
+        for i, v in enumerate(vis):
+            bh = max(1, int(min(v, scale) / scale * (h - 2))) if v > 0 else 1
+            x = w - 1 - self.BAR_W - (count - 1 - i) * step
+            dc.DrawRectangle(x, h - 1 - bh, self.BAR_W, bh)
+
+        # judul + nilai terakhir (kiri atas), skala (kanan atas)
+        last = vis[-1] if vis else 0.0
+        dc.SetFont(wx.Font(8, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
+        dc.SetTextForeground(wx.Colour(60, 68, 85))
+        dc.DrawText(self.title, 4, 2)
+        dc.SetFont(wx.Font(9, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
+        dc.SetTextForeground(self.color)
+        dc.DrawText(f"{last:.1f} Mbps", 4, 16)
+        dc.SetFont(wx.Font(7, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL))
+        dc.SetTextForeground(wx.Colour(130, 138, 150))
+        label = f"{scale} Mbps"
+        dc.DrawText(label, w - dc.GetTextExtent(label)[0] - 4, 2)
+
+
 class MainFrame(wx.Frame):
     def __init__(self):
-        super().__init__(None, title="Info IP Saya + Network Tools", size=(1200, 780))
-        self.SetMinSize((1080, 700))
+        super().__init__(None, title="Info IP Saya + Network Tools v5", size=(1300, 820))
+        self.SetMinSize((1200, 760))
         self.ip_text = ""
         self.lat = None
         self.lon = None
@@ -634,10 +1264,17 @@ class MainFrame(wx.Frame):
         self.stats = PingStats()
         self.mode = None
         self.scan = None
+        self.qr_text = ""
+        self.left_visible = True
+        self.srv = None
+        self.srv_url = ""
+        self.srv_last = (0, 0, 0.0)
         self.sp = {"ping": None, "download": None, "upload": None}   # hasil speedtest (Mbps / ms)
         self.sp_phase = ""
         self.timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_timer, self.timer)
+        self.srv_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self.on_srv_timer, self.srv_timer)
         self._build_ui()
         self.Centre()
         self.refresh()
@@ -645,14 +1282,25 @@ class MainFrame(wx.Frame):
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
         panel = wx.Panel(self)
+        self.panel = panel
         panel.SetBackgroundColour(wx.Colour(245, 247, 250))
         root = wx.BoxSizer(wx.HORIZONTAL)
+        self.root = root
 
         left = self._build_left(panel)
+        self.left_sizer = left
         right = self._build_right(panel)
 
-        root.Add(left, 4, wx.EXPAND)
-        root.Add(wx.StaticLine(panel, style=wx.LI_VERTICAL), 0, wx.EXPAND | wx.TOP | wx.BOTTOM, 16)
+        # tombol toggle tipis (pengganti garis pemisah): tampil / sembunyikan panel kiri
+        self.toggle_btn = GenButton(panel, label="\u25c0", size=(22, -1))
+        self.toggle_btn.SetUseFocusIndicator(False)
+        self.toggle_btn.SetBackgroundColour(wx.Colour(222, 227, 238))
+        self.toggle_btn.SetForegroundColour(wx.Colour(60, 70, 95))
+        self.toggle_btn.SetToolTip("Tampilkan / sembunyikan panel kiri")
+        self.toggle_btn.Bind(wx.EVT_BUTTON, self.on_toggle_left)
+
+        root.Add(left, 3, wx.EXPAND)
+        root.Add(self.toggle_btn, 0, wx.EXPAND | wx.TOP | wx.BOTTOM | wx.LEFT | wx.RIGHT, 6)
         root.Add(right, 5, wx.EXPAND)
         panel.SetSizer(root)
 
@@ -704,14 +1352,14 @@ class MainFrame(wx.Frame):
             kf = key.GetFont()
             kf.SetWeight(wx.FONTWEIGHT_BOLD)
             key.SetFont(kf)
-            key_sizer.Add(key, 1, wx.EXPAND | wx.ALL, 8)
+            key_sizer.Add(key, 1, wx.EXPAND | wx.ALL, 6)
             key_panel.SetSizer(key_sizer)
 
             val_panel = wx.Panel(panel)
             val_panel.SetBackgroundColour(bg)
             val_sizer = wx.BoxSizer(wx.VERTICAL)
             val = wx.StaticText(val_panel, label="-")
-            val_sizer.Add(val, 1, wx.EXPAND | wx.ALL, 8)
+            val_sizer.Add(val, 1, wx.EXPAND | wx.ALL, 6)
             val_panel.SetSizer(val_sizer)
 
             grid.Add(key_panel, 0, wx.EXPAND)
@@ -736,27 +1384,72 @@ class MainFrame(wx.Frame):
         self.btn_map.Bind(wx.EVT_BUTTON, self.on_map)
         self.btn_copy.Disable()
         self.btn_map.Disable()
+        self._build_server_box(panel, left)
         return left
 
+    def _build_server_box(self, panel, left):
+        """Kotak 'Server Speedtest LAN' di paling bawah sisi kiri."""
+        box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Server Speedtest LAN")
+        sb = box.GetStaticBox()
+
+        # bandwidth bar (di atas tombol)
+        bars = wx.BoxSizer(wx.HORIZONTAL)
+        self.bw_up = BandwidthGraph(sb, "UPLOAD SERVER", BLUE, height=84)
+        self.bw_down = BandwidthGraph(sb, "DOWNLOAD SERVER", GREEN, height=84)
+        bars.Add(self.bw_up, 1, wx.EXPAND | wx.RIGHT, 6)
+        bars.Add(self.bw_down, 1, wx.EXPAND)
+        box.Add(bars, 0, wx.EXPAND | wx.ALL, 8)
+
+        # tombol START SERVER / STOP SERVER / PORT
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        self.srv_start_btn = make_button(sb, "START SERVER", GREEN)
+        self.srv_stop_btn = make_button(sb, "STOP SERVER", GREY)
+        self.srv_stop_btn.Disable()
+        port_lbl = wx.StaticText(sb, label="PORT:")
+        self.srv_port = wx.TextCtrl(sb, value=str(SERVER_DEFAULT_PORT), size=(70, -1),
+                                    style=wx.TE_CENTER)
+        row.Add(self.srv_start_btn, 1, wx.EXPAND | wx.RIGHT, 6)
+        row.Add(self.srv_stop_btn, 1, wx.EXPAND | wx.RIGHT, 10)
+        row.Add(port_lbl, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        row.Add(self.srv_port, 0, wx.ALIGN_CENTER_VERTICAL)
+        box.Add(row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
+
+        # status: http://IP:PORT  Sedang Berjalan
+        self.srv_status = wx.StaticText(sb, label="Server mati")
+        sf = self.srv_status.GetFont()
+        sf.SetWeight(wx.FONTWEIGHT_BOLD)
+        self.srv_status.SetFont(sf)
+        self.srv_status.SetForegroundColour(wx.Colour(120, 128, 140))
+        box.Add(self.srv_status, 0, wx.ALL, 8)
+
+        left.AddStretchSpacer(1)
+        left.Add(box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 16)
+
+        self.srv_start_btn.Bind(wx.EVT_BUTTON, lambda e: self.start_server())
+        self.srv_stop_btn.Bind(wx.EVT_BUTTON, lambda e: self.stop_server())
+
     def _build_right(self, panel):
-        """Sisi kanan: input + tombol (2 baris) + grafik ping / gauge + statistik + log."""
+        """Sisi kanan: input + tombol (2 baris) + grafik ping / gauge / QR + statistik + log."""
         right = wx.BoxSizer(wx.VERTICAL)
         self.right = right
 
-        caption = wx.StaticText(panel, label="Network Tools - IP / Alamat Web      (IP SCANNER: 192.168.1.1-192.168.1.254)")
+        caption = wx.StaticText(
+            panel,
+            label="Network Tools - IP / Alamat Web / Teks QR      (IP SCANNER: 192.168.1.1-192.168.1.254)")
         caption.SetForegroundColour(wx.Colour(100, 110, 125))
         right.Add(caption, 0, wx.LEFT | wx.RIGHT | wx.TOP, 16)
 
         self.host = wx.TextCtrl(panel, value="8.8.8.8", style=wx.TE_PROCESS_ENTER)
         right.Add(self.host, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 16)
 
-        # baris 1: lima tombol alat
+        # baris 1: tujuh tombol alat
         self.ping_btn = make_button(panel, "PING", GREEN)
         self.trace_btn = make_button(panel, "TRACERT", GREEN)
         self.port_btn = make_button(panel, "PORT", GREEN)
         self.ipscan_btn = make_button(panel, "IP SCANNER", GREEN)
         self.speed_btn = make_button(panel, "SPEEDTEST", GREEN)
         self.http_btn = make_button(panel, "HTTP CHECKER", GREEN)
+        self.qr_btn = make_button(panel, "QR GENERATOR", GREEN)
         self.stop_btn = make_button(panel, "STOP", GREY)
         self.stop_btn.Disable()
 
@@ -766,7 +1459,8 @@ class MainFrame(wx.Frame):
         brow1.Add(self.port_btn, 1, wx.EXPAND | wx.RIGHT, 8)
         brow1.Add(self.ipscan_btn, 1, wx.EXPAND | wx.RIGHT, 8)
         brow1.Add(self.speed_btn, 1, wx.EXPAND | wx.RIGHT, 8)
-        brow1.Add(self.http_btn, 1, wx.EXPAND)
+        brow1.Add(self.http_btn, 1, wx.EXPAND | wx.RIGHT, 8)
+        brow1.Add(self.qr_btn, 1, wx.EXPAND)
         right.Add(brow1, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 16)
 
         # baris 2: STOP selebar penuh
@@ -781,8 +1475,16 @@ class MainFrame(wx.Frame):
         right.Add(self.gauge, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 16)
         right.Show(self.gauge, False)
 
-        # angka besar (ms / Hop / kecepatan) + statistik tebal di sebelahnya
-        info_row = wx.BoxSizer(wx.HORIZONTAL)
+        # QR code + tombol simpan (menggantikan grafik saat QR GENERATOR dipakai)
+        self.qr_box = wx.BoxSizer(wx.VERTICAL)
+        self.qr_panel = QRPanel(panel, height=260)
+        self.save_btn = make_button(panel, "SIMPAN QR (PNG)", BLUE)
+        self.qr_box.Add(self.qr_panel, 1, wx.EXPAND)
+        self.qr_box.Add(self.save_btn, 0, wx.EXPAND | wx.TOP, 8)
+        right.Add(self.qr_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 16)
+        right.Show(self.qr_box, False)
+
+        # angka besar (ms / Hop / kecepatan), lalu statistik satu baris di bawahnya
         self.big = wx.StaticText(
             panel, label="--", style=wx.ALIGN_CENTER_HORIZONTAL | wx.ST_NO_AUTORESIZE
         )
@@ -792,9 +1494,8 @@ class MainFrame(wx.Frame):
         self.big.SetFont(bf)
         self.big.SetMinSize((200, 48))
         self.stats_bar = StatsBar(panel)
-        info_row.Add(self.big, 0, wx.ALIGN_CENTER_VERTICAL)
-        info_row.Add(self.stats_bar, 1, wx.EXPAND | wx.LEFT, 12)
-        right.Add(info_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 16)
+        right.Add(self.big, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 16)
+        right.Add(self.stats_bar, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 4)
 
         # radio button satuan speedtest (tepat di atas kotak output)
         unit_row = wx.BoxSizer(wx.HORIZONTAL)
@@ -806,7 +1507,7 @@ class MainFrame(wx.Frame):
         unit_row.Add(unit_lbl, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
         unit_row.Add(self.rb_mbps, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 12)
         unit_row.Add(self.rb_mbs, 0, wx.ALIGN_CENTER_VERTICAL)
-        right.Add(unit_row, 0, wx.LEFT | wx.RIGHT | wx.TOP, 16)
+        right.Add(unit_row, 0, wx.LEFT | wx.RIGHT | wx.TOP, 12)
 
         self.log = wx.TextCtrl(panel, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
         self.log.SetFont(wx.Font(10, wx.FONTFAMILY_TELETYPE, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL))
@@ -818,6 +1519,8 @@ class MainFrame(wx.Frame):
         self.ipscan_btn.Bind(wx.EVT_BUTTON, lambda e: self.start_tool("ipscan"))
         self.speed_btn.Bind(wx.EVT_BUTTON, lambda e: self.start_tool("speedtest"))
         self.http_btn.Bind(wx.EVT_BUTTON, lambda e: self.start_tool("http"))
+        self.qr_btn.Bind(wx.EVT_BUTTON, lambda e: self.start_tool("qr"))
+        self.save_btn.Bind(wx.EVT_BUTTON, self.on_save_qr)
         self.host.Bind(wx.EVT_TEXT_ENTER, lambda e: self.start_tool("ping"))
         self.stop_btn.Bind(wx.EVT_BUTTON, lambda e: self.stop_proc())
         self.rb_mbps.Bind(wx.EVT_RADIOBUTTON, self.on_unit)
@@ -930,7 +1633,8 @@ class MainFrame(wx.Frame):
 
     # ------------------------------------------------- Network Tools (kanan)
     def set_busy(self, busy):
-        tools = (self.ping_btn, self.trace_btn, self.port_btn, self.ipscan_btn, self.speed_btn, self.http_btn)
+        tools = (self.ping_btn, self.trace_btn, self.port_btn, self.ipscan_btn,
+                 self.speed_btn, self.http_btn, self.qr_btn)
         for b in tools:
             b.Enable(not busy)
             b.SetBackgroundColour(GREY if busy else GREEN)
@@ -941,10 +1645,11 @@ class MainFrame(wx.Frame):
         for b in tools + (self.stop_btn,):
             b.Refresh()
 
-    def show_gauge(self, gauge):
-        """True = tampilkan gauge speedtest, False = tampilkan grafik ping."""
-        self.right.Show(self.graph, not gauge)
-        self.right.Show(self.gauge, gauge)
+    def show_view(self, view):
+        """view: 'graph' (grafik ping), 'gauge' (speedtest), atau 'qr' (QR code)."""
+        self.right.Show(self.graph, view == "graph")
+        self.right.Show(self.gauge, view == "gauge")
+        self.right.Show(self.qr_box, view == "qr")
         self.right.Layout()
 
     def current_unit(self):
@@ -959,6 +1664,10 @@ class MainFrame(wx.Frame):
     def update_stats(self):
         st = self.stats
         D, S = StatsBar.DARK, StatsBar.SEP
+
+        # QR dan HTTP mengisi statistiknya sendiri
+        if self.mode in ("qr", "http"):
+            return
 
         if self.mode == "speedtest":
             sep = ("  |  ", S)
@@ -998,21 +1707,163 @@ class MainFrame(wx.Frame):
         min_txt = fmt_ms(st.min) if st.min is not None else "--"
         loss_txt = f"{round(loss, 1):g}%" if loss is not None else "--"
         loss_col = RED if st.lost > 0 else D
-        sep = ("  |  ", S)
+        sep = (" | ", S)
 
-        line1 = [("ping : ", D), (ping_txt, ping_col), sep,
-                 ("avg : ", D), (avg_txt, D), sep,
-                 ("max : ", D), (max_txt, D)]
-        line2 = [("min : ", D), (min_txt, D), sep,
-                 ("loss : ", D), (loss_txt, loss_col), sep,
-                 ("time : ", D), (st.elapsed_text(), D)]
-        self.stats_bar.set_lines([line1, line2])
+        # semua dalam SATU baris
+        line = [("ping : ", D), (ping_txt, ping_col), sep,
+                ("avg : ", D), (avg_txt, D), sep,
+                ("max : ", D), (max_txt, D), sep,
+                ("min : ", D), (min_txt, D), sep,
+                ("loss : ", D), (loss_txt, loss_col), sep,
+                ("time : ", D), (st.elapsed_text(), D)]
+        self.stats_bar.set_lines([line])
 
     def on_timer(self, _evt):
         if self.running:
             self.update_stats()
 
+    # ------------------------------------------------------- QR Generator
+    def make_qr(self):
+        text = self.host.GetValue().strip()
+        if not text:
+            wx.MessageBox("Isi teks atau URL di kolom input dulu, lalu klik QR GENERATOR.",
+                          "QR Generator", wx.OK | wx.ICON_WARNING)
+            return
+        try:
+            matrix = build_qr_matrix(text)
+        except ImportError:
+            wx.MessageBox("Library 'qrcode' belum terpasang.\n\nJalankan di terminal / CMD:\n"
+                          "    pip install qrcode",
+                          "QR Generator", wx.OK | wx.ICON_ERROR)
+            return
+        except Exception as exc:
+            wx.MessageBox(f"Gagal membuat QR code.\n\nDetail: {exc}\n"
+                          "(Teks mungkin terlalu panjang.)",
+                          "QR Generator", wx.OK | wx.ICON_ERROR)
+            return
+
+        self.mode = "qr"
+        self.qr_text = text
+        self.qr_panel.set_matrix(matrix)
+        self.show_view("qr")
+        n = len(matrix)
+        self.big.SetLabel("QR")
+        self.big.SetForegroundColour(wx.Colour(30, 35, 45))
+        D, S = StatsBar.DARK, StatsBar.SEP
+        self.stats_bar.set_lines([
+            [("panjang data : ", D), (f"{len(text)} karakter", D), (" | ", S),
+             ("ukuran : ", D), (f"{n} x {n} modul", D)],
+        ])
+        self.log.Clear()
+        self.append_log(f"QR code dibuat dari:\n{text}\n\nKlik 'SIMPAN QR (PNG)' untuk menyimpan gambar.")
+        self.SetStatusText("QR code berhasil dibuat")
+
+    def on_save_qr(self, _evt):
+        if not self.qr_panel.matrix:
+            return
+        with wx.FileDialog(self, "Simpan QR Code", wildcard="Gambar PNG (*.png)|*.png",
+                           defaultFile="qrcode.png",
+                           style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            path = dlg.GetPath()
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        bmp = self.qr_panel.to_bitmap()
+        if bmp.SaveFile(path, wx.BITMAP_TYPE_PNG):
+            self.SetStatusText(f"QR code disimpan: {path}")
+            wx.MessageBox(f"QR code berhasil disimpan:\n{path}", "QR Generator",
+                          wx.OK | wx.ICON_INFORMATION)
+        else:
+            wx.MessageBox("Gagal menyimpan file.", "QR Generator", wx.OK | wx.ICON_ERROR)
+
+    # ------------------------------------------------ Toggle panel kiri (v5)
+    def on_toggle_left(self, _evt=None):
+        self.left_visible = not self.left_visible
+        self.root.Show(self.left_sizer, self.left_visible)
+        self.toggle_btn.SetLabel("\u25c0" if self.left_visible else "\u25b6")
+        self.panel.Layout()
+        self.panel.Refresh()
+
+    # ------------------------------------------- Server Speedtest LAN (v5)
+    def set_server_ui(self, running):
+        self.srv_start_btn.Enable(not running)
+        self.srv_stop_btn.Enable(running)
+        self.srv_start_btn.SetBackgroundColour(GREY if running else GREEN)
+        self.srv_stop_btn.SetBackgroundColour(RED if running else GREY)
+        self.srv_port.Enable(not running)
+        if running:
+            self.srv_status.SetLabel(f"{self.srv_url}  Sedang Berjalan")
+            self.srv_status.SetForegroundColour(GREEN)
+        else:
+            self.srv_status.SetLabel("Server mati")
+            self.srv_status.SetForegroundColour(wx.Colour(120, 128, 140))
+        for b in (self.srv_start_btn, self.srv_stop_btn):
+            b.Refresh()
+        self.panel.Layout()
+
+    def start_server(self):
+        if self.srv is not None:
+            return
+        try:
+            port = int(self.srv_port.GetValue().strip())
+            if not 1 <= port <= 65535:
+                raise ValueError
+        except ValueError:
+            wx.MessageBox("Port harus berupa angka 1 - 65535.", "Server Speedtest LAN",
+                          wx.OK | wx.ICON_WARNING)
+            return
+
+        srv = LanSpeedServer(port, on_log=lambda m: wx.CallAfter(self.append_log, m))
+        try:
+            srv.start()
+        except OSError as exc:
+            wx.MessageBox(
+                f"Server gagal dijalankan di port {port}.\n\nDetail: {exc}\n\n"
+                "Kemungkinan port sedang dipakai program lain. Coba port lain.",
+                "Server Speedtest LAN", wx.OK | wx.ICON_ERROR)
+            return
+
+        self.srv = srv
+        self.srv_url = f"http://{get_private_ip()}:{port}"
+        self.srv_last = (0, 0, time.monotonic())
+        self.bw_up.clear()
+        self.bw_down.clear()
+        self.set_server_ui(True)
+        self.srv_timer.Start(500)
+        self.append_log(f"[SERVER] Speedtest LAN berjalan: {self.srv_url}")
+        self.SetStatusText(f"Server Speedtest LAN berjalan di {self.srv_url}")
+
+    def stop_server(self):
+        if self.srv is None:
+            return
+        self.srv_timer.Stop()
+        srv, self.srv = self.srv, None
+        srv.stop()
+        self.bw_up.add(0.0)
+        self.bw_down.add(0.0)
+        self.set_server_ui(False)
+        self.append_log("[SERVER] Speedtest LAN dihentikan.")
+        self.SetStatusText("Server Speedtest LAN dihentikan")
+
+    def on_srv_timer(self, _evt):
+        if self.srv is None:
+            return
+        up, down = self.srv.counters()
+        now = time.monotonic()
+        pu, pd, pt = self.srv_last
+        dt = now - pt
+        if dt > 0:
+            self.bw_up.add((up - pu) * 8 / 1e6 / dt)       # klien upload -> server terima
+            self.bw_down.add((down - pd) * 8 / 1e6 / dt)   # klien download <- server kirim
+        self.srv_last = (up, down, now)
+
     def start_tool(self, mode):
+        if mode == "qr":
+            if not self.running:
+                self.make_qr()
+            return
+
         target = self.host.GetValue().strip()
         if self.running:
             return
@@ -1070,7 +1921,7 @@ class MainFrame(wx.Frame):
         if mode in ("ping", "port", "ipscan"):
             self.timer.Start(1000)
 
-        self.show_gauge(mode == "speedtest")
+        self.show_view("gauge" if mode == "speedtest" else "graph")
         self.update_stats()
         self.big.SetLabel("...")
         self.big.SetForegroundColour(wx.Colour(30, 35, 45))
@@ -1102,6 +1953,10 @@ class MainFrame(wx.Frame):
 
     def on_close(self, evt):
         self.timer.Stop()
+        self.srv_timer.Stop()
+        if self.srv is not None:
+            self.srv.stop()
+            self.srv = None
         self.gauge.timer.Stop()
         self.stop_proc()
         evt.Skip()
@@ -1283,7 +2138,6 @@ class MainFrame(wx.Frame):
         self.append_log(f"Server       : {server}")
         self.append_log(f"Final URL    : {final_url}")
         self.append_log(f"Kesimpulan   : {'ONLINE / OK' if ok else 'HTTP ERROR'}")
-
 
     # ------------------------------------------------------------ Speedtest
     def on_unit(self, _evt):
