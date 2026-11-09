@@ -22,6 +22,16 @@ V5 (baru):
                        Bandwidth bar UPLOAD SERVER / DOWNLOAD SERVER tampil live ala Winbox.
                        (UPLOAD = klien upload ke server, DOWNLOAD = klien download dari server)
 
+V7 (baru): MODE SIANG / MALAM - dua tombol ikon (bulan = malam, matahari = siang)
+        di pojok kanan atas sisi kanan. Pilihan tema diingat di file ipsaya.cfg.
+
+V6 (halaman web Speedtest LAN):
+        - Setelah tes selesai / dihentikan, jarum kembali ke NOL.
+        - Tombol: [MULAI TES] (sekali jalan: ping+download+upload)
+                  [HANYA TES DOWNLOAD] [HANYA TES UPLOAD] [TES KEDUANYA]
+                  [BERHENTI TES]
+          Tiga tombol mode berjalan terus (berulang) sampai klien klik BERHENTI TES.
+
 Instalasi : pip install wxPython qrcode
 Jalankan  : python ipsaya.pyw
 
@@ -74,6 +84,53 @@ RED = wx.Colour(200, 40, 40)
 GREY = wx.Colour(160, 160, 160)
 BLUE = wx.Colour(30, 110, 220)
 PURPLE = wx.Colour(120, 70, 200)
+SLATE = wx.Colour(80, 92, 120)
+
+# ---- tema siang / malam (v7) ----
+THEMES = {
+    "day": {
+        "bg": wx.Colour(245, 247, 250), "text": wx.Colour(30, 35, 45), "dim": wx.Colour(100, 110, 125),
+        "row_a": wx.Colour(255, 255, 255), "row_b": wx.Colour(238, 241, 246),
+        "input_bg": wx.Colour(255, 255, 255), "input_fg": wx.Colour(20, 24, 32),
+        "graph_bg": wx.Colour(255, 255, 255), "graph_border": wx.Colour(200, 205, 215),
+        "graph_grid": wx.Colour(228, 232, 238), "graph_vline": wx.Colour(185, 194, 210),
+        "graph_title": wx.Colour(60, 68, 85),
+        "btn_active": wx.Colour(205, 222, 250), "btn_hover": wx.Colour(228, 234, 245),
+        "tog_bg": wx.Colour(222, 227, 238), "tog_fg": wx.Colour(60, 70, 95),
+    },
+    "night": {
+        "bg": wx.Colour(22, 26, 38), "text": wx.Colour(225, 230, 240), "dim": wx.Colour(150, 160, 182),
+        "row_a": wx.Colour(30, 35, 52), "row_b": wx.Colour(37, 43, 62),
+        "input_bg": wx.Colour(30, 35, 52), "input_fg": wx.Colour(225, 230, 240),
+        "graph_bg": wx.Colour(16, 20, 30), "graph_border": wx.Colour(60, 68, 92),
+        "graph_grid": wx.Colour(34, 40, 58), "graph_vline": wx.Colour(70, 80, 108),
+        "graph_title": wx.Colour(190, 198, 215),
+        "btn_active": wx.Colour(62, 74, 120), "btn_hover": wx.Colour(42, 50, 78),
+        "tog_bg": wx.Colour(45, 52, 76), "tog_fg": wx.Colour(200, 208, 225),
+    },
+}
+THEME = dict(THEMES["day"])                       # tema yang sedang aktif
+TEXT_COLOURS = (THEMES["day"]["text"], THEMES["night"]["text"])
+CFG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ipsaya.cfg")
+
+
+def load_theme_name():
+    try:
+        with open(CFG_FILE, encoding="utf-8") as f:
+            name = json.load(f).get("theme")
+        if name in THEMES:
+            return name
+    except Exception:
+        pass
+    return "day"
+
+
+def save_theme_name(name):
+    try:
+        with open(CFG_FILE, "w", encoding="utf-8") as f:
+            json.dump({"theme": name}, f)
+    except Exception:
+        pass
 
 # ---- pengaturan speedtest ----
 SPEED_HOST = "speed.cloudflare.com"
@@ -86,9 +143,9 @@ HTTP_TIMEOUT = 10
 HTTP_UA = "IPInfoApp/1.0 HTTP Checker"
 
 
-def make_button(parent, label, color):
+def make_button(parent, label, color, size=(60, 34)):
     """Tombol berwarna (GenButton supaya warna konsisten di semua OS)."""
-    btn = GenButton(parent, label=label, size=(60, 34))
+    btn = GenButton(parent, label=label, size=size)
     btn.SetUseFocusIndicator(False)
     btn.SetForegroundColour(wx.WHITE)
     btn.SetBackgroundColour(color)
@@ -334,6 +391,74 @@ class QRPanel(wx.Panel):
         return bmp
 
 
+class ThemeButton(wx.Panel):
+    """Tombol ikon tanpa teks. kind: 'sun' = Mode Siang, 'moon' = Mode Malam."""
+
+    SIZE = 36
+
+    def __init__(self, parent, kind, tip, on_click):
+        super().__init__(parent, size=(self.SIZE, self.SIZE))
+        self.SetMinSize((self.SIZE, self.SIZE))
+        self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self.kind = kind
+        self.on_click = on_click
+        self.active = False
+        self.hover = False
+        self.SetToolTip(tip)
+        self.SetCursor(wx.Cursor(wx.CURSOR_HAND))
+        self.Bind(wx.EVT_PAINT, self.on_paint)
+        self.Bind(wx.EVT_LEFT_DOWN, lambda e: self.on_click())
+        self.Bind(wx.EVT_ENTER_WINDOW, lambda e: self._set_hover(True))
+        self.Bind(wx.EVT_LEAVE_WINDOW, lambda e: self._set_hover(False))
+
+    def set_active(self, value):
+        self.active = value
+        self.Refresh()
+
+    def _set_hover(self, value):
+        self.hover = value
+        self.Refresh()
+
+    def on_paint(self, _evt):
+        dc = wx.AutoBufferedPaintDC(self)
+        dc.SetBackground(wx.Brush(THEME["bg"]))
+        dc.Clear()
+        gc = wx.GraphicsContext.Create(dc)
+        if gc is None:
+            return
+        w, h = self.GetClientSize()
+        if self.active:
+            bg = THEME["btn_active"]
+        elif self.hover:
+            bg = THEME["btn_hover"]
+        else:
+            bg = THEME["bg"]
+        gc.SetPen(wx.TRANSPARENT_PEN)
+        gc.SetBrush(wx.Brush(bg))
+        gc.DrawRoundedRectangle(0, 0, w, h, 8)
+        cx, cy = w / 2.0, h / 2.0
+
+        if self.kind == "sun":
+            gold = wx.Colour(255, 168, 0)
+            gc.SetBrush(wx.Brush(gold))
+            gc.DrawEllipse(cx - 6, cy - 6, 12, 12)
+            pen = wx.Pen(gold, 2)
+            pen.SetCap(wx.CAP_ROUND)
+            gc.SetPen(pen)
+            for k in range(8):
+                a = k * math.pi / 4
+                ray = gc.CreatePath()
+                ray.MoveToPoint(cx + 9.5 * math.cos(a), cy + 9.5 * math.sin(a))
+                ray.AddLineToPoint(cx + 13 * math.cos(a), cy + 13 * math.sin(a))
+                gc.StrokePath(ray)
+        else:
+            # bulan sabit: lingkaran kuning, lalu dipotong lingkaran berwarna latar
+            gc.SetBrush(wx.Brush(wx.Colour(245, 215, 110)))
+            gc.DrawEllipse(cx - 9, cy - 9, 18, 18)
+            gc.SetBrush(wx.Brush(bg))
+            gc.DrawEllipse(cx - 2, cy - 12, 16, 16)
+
+
 class PingGraph(wx.Panel):
     """Grafik batang ping ala Winbox. Batang baru muncul di kanan.
     Batang makin pendek = ping makin bagus. Timeout = batang merah penuh.
@@ -385,16 +510,16 @@ class PingGraph(wx.Panel):
     def on_paint(self, _evt):
         dc = wx.AutoBufferedPaintDC(self)
         w, h = self.GetClientSize()
-        dc.SetBackground(wx.Brush(wx.WHITE))
+        dc.SetBackground(wx.Brush(THEME["graph_bg"]))
         dc.Clear()
 
         # bingkai
-        dc.SetPen(wx.Pen(wx.Colour(200, 205, 215)))
+        dc.SetPen(wx.Pen(THEME["graph_border"]))
         dc.SetBrush(wx.TRANSPARENT_BRUSH)
         dc.DrawRectangle(0, 0, w, h)
 
         # garis bantu horizontal 25% / 50% / 75%
-        dc.SetPen(wx.Pen(wx.Colour(228, 232, 238)))
+        dc.SetPen(wx.Pen(THEME["graph_grid"]))
         for frac in (0.25, 0.5, 0.75):
             y = int(h - 1 - frac * (h - 2))
             dc.DrawLine(1, y, w - 1, y)
@@ -419,7 +544,7 @@ class PingGraph(wx.Panel):
                 bucket = int((vis[i][0] - self.t0) // interval)
                 if bucket != prev:
                     gx = bar_x(i) - 1
-                    dc.SetPen(wx.Pen(wx.Colour(185, 194, 210)))
+                    dc.SetPen(wx.Pen(THEME["graph_vline"]))
                     dc.DrawLine(gx, 1, gx, h - 1)
                     secs = bucket * interval
                     label = f"{secs // 60}:{secs % 60:02d}"
@@ -715,6 +840,8 @@ class StatsBar(wx.Panel):
             line_w = sum(dc.GetTextExtent(t)[0] for t, _ in line)
             x = max(0, (w - line_w) // 2)
             for text, colour in line:
+                if colour in TEXT_COLOURS:
+                    colour = THEME["text"]
                 dc.SetTextForeground(colour)
                 dc.DrawText(text, x, y)
                 x += dc.GetTextExtent(text)[0]
@@ -758,6 +885,12 @@ svg{width:100%;height:auto;max-width:420px;display:block;margin:0 auto}
 .units button{background:none;border:1px solid var(--line);color:var(--dim);border-radius:8px;padding:5px 12px;margin-left:6px;cursor:pointer}
 .units button.on{background:#2a3566;color:#fff}
 .msg{margin-top:12px;color:#ff8a8a;font-size:13px;min-height:18px}
+.row3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px}
+.mode{border:1px solid #3a4a8f;background:#1c2756;color:#fff;border-radius:12px;padding:12px 4px;font-size:12px;font-weight:700;letter-spacing:.5px;cursor:pointer}
+.mode:disabled{opacity:.45;cursor:default}
+#stop{width:100%;margin-top:10px;border:0;border-radius:999px;padding:13px;font-size:15px;font-weight:800;letter-spacing:2px;color:#fff;background:#c82828;cursor:pointer}
+#stop:disabled{background:#4a4f66;opacity:.6;cursor:default}
+.info{margin-top:10px;color:#8f9bc4;font-size:12px;min-height:16px}
 </style>
 </head>
 <body>
@@ -791,6 +924,13 @@ svg{width:100%;height:auto;max-width:420px;display:block;margin:0 auto}
   </div>
 
   <button id="go">MULAI TES</button>
+  <div class="row3">
+    <button class="mode" id="b-down">HANYA TES DOWNLOAD</button>
+    <button class="mode" id="b-up">HANYA TES UPLOAD</button>
+    <button class="mode" id="b-both">TES KEDUANYA</button>
+  </div>
+  <button id="stop" disabled>BERHENTI TES</button>
+  <div class="info" id="info"></div>
   <div class="units">Satuan:
     <button data-u="Mbps" class="on">Mbps</button><button data-u="MB/s">MB/s</button>
   </div>
@@ -805,7 +945,7 @@ svg{width:100%;height:auto;max-width:420px;display:block;margin:0 auto}
   var STREAMS = 6, DUR = 10000, WARM = 1000;
   var NS = 'http://www.w3.org/2000/svg';
   var unit = 'Mbps', maxv = 100, target = 0, shown = 0, running = false;
-  var bigText = null, blobCache = null;
+  var bigText = null, blobCache = null, stopReq = false;
   var res = { ping: null, jitter: null, down: null, up: null };
 
   function $(i) { return document.getElementById(i); }
@@ -884,12 +1024,14 @@ svg{width:100%;height:auto;max-width:420px;display:block;margin:0 auto}
   async function measurePing() {
     var t = [];
     for (var i = 0; i < 12; i++) {
+      if (stopReq) return null;
       var s = performance.now();
       var r = await fetch('/ping?r=' + Math.random(), { cache: 'no-store' });
       await r.text();
       t.push(performance.now() - s);
       await sleep(60);
     }
+    if (t.length < 3) return null;
     t.shift();                                   // buang sampel pertama (handshake)
     var avg = t.reduce(function (a, b) { return a + b; }, 0) / t.length, j = 0;
     for (var k = 1; k < t.length; k++) j += Math.abs(t[k] - t[k - 1]);
@@ -965,7 +1107,7 @@ svg{width:100%;height:auto;max-width:420px;display:block;margin:0 auto}
         var o = hist[0];
         if (now > o[0]) target = (st.bytes - o[1]) * 8 / 1e6 / ((now - o[0]) / 1000);
         if (!warm && now - t0 >= WARM) warm = [now, st.bytes];
-        if (now - t0 >= DUR) {
+        if (now - t0 >= DUR || stopReq) {
           clearInterval(iv);
           end = [now, st.bytes];
           resolve();
@@ -976,6 +1118,7 @@ svg{width:100%;height:auto;max-width:420px;display:block;margin:0 auto}
     ctrl.abort();
     xhrs.forEach(function (x) { try { x.abort(); } catch (e) {} });
     await Promise.all(workers);
+    if (stopReq && end[0] - t0 < 2000) return null;   // dihentikan terlalu cepat: abaikan
     if (end[1] === 0) throw new Error('tidak ada data yang diterima');
     var w = warm || [t0, 0];
     var span = (end[0] - w[0]) / 1000;
@@ -983,41 +1126,71 @@ svg{width:100%;height:auto;max-width:420px;display:block;margin:0 auto}
   }
 
   // ---- alur utama ----
-  async function start() {
+  function setButtons(run) {
+    ['go', 'b-down', 'b-up', 'b-both'].forEach(function (id) { $(id).disabled = run; });
+    $('stop').disabled = !run;
+  }
+
+  // mode: 'once' = ping + download + upload sekali jalan
+  //       'down' / 'up' / 'both' = berulang terus sampai BERHENTI TES diklik
+  async function runTest(mode) {
     if (running) return;
     running = true;
-    var btn = $('go');
-    btn.disabled = true;
-    btn.textContent = 'MENGUKUR...';
+    stopReq = false;
+    setButtons(true);
+    var loop = mode !== 'once', failed = false;
     $('msg').textContent = '';
+    $('info').textContent = loop ? 'Tes berjalan terus sampai kamu klik BERHENTI TES.' : '';
     res = { ping: null, jitter: null, down: null, up: null };
     render();
     try {
       setPhase('PING'); bigText = '...'; resetScale();
       var p = await measurePing();
-      res.ping = p[0]; res.jitter = p[1]; render();
-
-      bigText = null; setPhase('DOWNLOAD'); resetScale();
-      res.down = await phaseRun('down'); render();
-
-      target = 0; await sleep(800);
-      setPhase('UPLOAD'); resetScale();
-      res.up = await phaseRun('up'); render();
-
-      setPhase('SELESAI');
-      target = res.down;
-    } catch (e) {
+      if (p) { res.ping = p[0]; res.jitter = p[1]; render(); }
       bigText = null;
-      setPhase('GAGAL');
+
+      var kinds = mode === 'down' ? ['down'] : mode === 'up' ? ['up'] : ['down', 'up'];
+      var prev = null, round = 0;
+      do {
+        round++;
+        for (var k = 0; k < kinds.length && !stopReq; k++) {
+          var kind = kinds[k];
+          var label = (kind === 'down' ? 'DOWNLOAD' : 'UPLOAD') + (loop ? ' \u2022 PUTARAN ' + round : '');
+          if (prev !== kind) {
+            if (prev !== null) { target = 0; await sleep(700); }
+            setPhase(label); resetScale();
+          } else {
+            $('phase').textContent = label;       // putaran baru, jarum tidak di-reset
+          }
+          prev = kind;
+          var v = await phaseRun(kind);
+          if (v !== null) { res[kind] = v; render(); }
+        }
+      } while (loop && !stopReq);
+    } catch (e) {
+      failed = true;
       $('msg').textContent = 'Tes gagal: ' + (e && e.message ? e.message : e);
     }
     running = false;
-    btn.disabled = false;
-    btn.textContent = 'ULANGI TES';
+    bigText = null;
+    setPhase(failed ? 'GAGAL' : stopReq ? 'DIHENTIKAN' : 'SELESAI');   // jarum kembali ke NOL
+    $('info').textContent = '';
+    setButtons(false);
   }
 
   $('host').textContent = location.host;
-  $('go').addEventListener('click', start);
+  $('go').addEventListener('click', function () { runTest('once'); });
+  $('b-down').addEventListener('click', function () { runTest('down'); });
+  $('b-up').addEventListener('click', function () { runTest('up'); });
+  $('b-both').addEventListener('click', function () { runTest('both'); });
+  $('stop').addEventListener('click', function () {
+    if (!running) return;
+    stopReq = true;
+    $('stop').disabled = true;
+    $('phase').textContent = 'MENGHENTIKAN...';
+    target = 0;
+  });
+  setButtons(false);
   var ub = document.querySelectorAll('.units button');
   for (var i = 0; i < ub.length; i++) {
     ub[i].addEventListener('click', function () {
@@ -1212,14 +1385,14 @@ class BandwidthGraph(wx.Panel):
     def on_paint(self, _evt):
         dc = wx.AutoBufferedPaintDC(self)
         w, h = self.GetClientSize()
-        dc.SetBackground(wx.Brush(wx.WHITE))
+        dc.SetBackground(wx.Brush(THEME["graph_bg"]))
         dc.Clear()
 
-        dc.SetPen(wx.Pen(wx.Colour(200, 205, 215)))
+        dc.SetPen(wx.Pen(THEME["graph_border"]))
         dc.SetBrush(wx.TRANSPARENT_BRUSH)
         dc.DrawRectangle(0, 0, w, h)
 
-        dc.SetPen(wx.Pen(wx.Colour(228, 232, 238)))
+        dc.SetPen(wx.Pen(THEME["graph_grid"]))
         for frac in (0.25, 0.5, 0.75):
             y = int(h - 1 - frac * (h - 2))
             dc.DrawLine(1, y, w - 1, y)
@@ -1240,7 +1413,7 @@ class BandwidthGraph(wx.Panel):
         # judul + nilai terakhir (kiri atas), skala (kanan atas)
         last = vis[-1] if vis else 0.0
         dc.SetFont(wx.Font(8, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
-        dc.SetTextForeground(wx.Colour(60, 68, 85))
+        dc.SetTextForeground(THEME["graph_title"])
         dc.DrawText(self.title, 4, 2)
         dc.SetFont(wx.Font(9, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
         dc.SetTextForeground(self.color)
@@ -1253,7 +1426,7 @@ class BandwidthGraph(wx.Panel):
 
 class MainFrame(wx.Frame):
     def __init__(self):
-        super().__init__(None, title="Info IP Saya + Network Tools v5", size=(1300, 820))
+        super().__init__(None, title="Info IP Saya + Network Tools v7", size=(1300, 820))
         self.SetMinSize((1200, 760))
         self.ip_text = ""
         self.lat = None
@@ -1269,6 +1442,8 @@ class MainFrame(wx.Frame):
         self.srv = None
         self.srv_url = ""
         self.srv_last = (0, 0, 0.0)
+        self.t_text, self.t_dim, self.t_rows, self.t_inputs = [], [], [], []
+        self.theme_name = load_theme_name()
         self.sp = {"ping": None, "download": None, "upload": None}   # hasil speedtest (Mbps / ms)
         self.sp_phase = ""
         self.timer = wx.Timer(self)
@@ -1276,6 +1451,7 @@ class MainFrame(wx.Frame):
         self.srv_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_srv_timer, self.srv_timer)
         self._build_ui()
+        self.apply_theme(self.theme_name, save=False)
         self.Centre()
         self.refresh()
 
@@ -1316,13 +1492,14 @@ class MainFrame(wx.Frame):
         ip_box = wx.BoxSizer(wx.VERTICAL)
 
         caption = wx.StaticText(panel, label="Alamat IP Publik Anda")
-        caption.SetForegroundColour(wx.Colour(100, 110, 125))
+        self.t_dim.append(caption)
 
         self.ip_label = wx.StaticText(panel, label="Memuat...")
         font = self.ip_label.GetFont()
         font.SetPointSize(font.GetPointSize() + 10)
         font.SetWeight(wx.FONTWEIGHT_BOLD)
         self.ip_label.SetFont(font)
+        self.t_text.append(self.ip_label)
 
         ip_box.Add(caption, 0, wx.BOTTOM, 4)
         ip_box.Add(self.ip_label, 0)
@@ -1365,15 +1542,16 @@ class MainFrame(wx.Frame):
             grid.Add(key_panel, 0, wx.EXPAND)
             grid.Add(val_panel, 1, wx.EXPAND)
             self.rows[name] = val
+            self.t_rows.append((key_panel, val_panel, key, val, i))
 
         grid.AddGrowableCol(0, 0)
         left.Add(grid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 16)
 
         # Tombol Refresh / Salin / Peta
         btns = wx.BoxSizer(wx.HORIZONTAL)
-        self.btn_refresh = wx.Button(panel, label="Refresh")
-        self.btn_copy = wx.Button(panel, label="Salin IP")
-        self.btn_map = wx.Button(panel, label="Buka di Peta")
+        self.btn_refresh = make_button(panel, "Refresh", SLATE, (110, 34))
+        self.btn_copy = make_button(panel, "Salin IP", SLATE, (110, 34))
+        self.btn_map = make_button(panel, "Buka di Peta", SLATE, (130, 34))
         btns.Add(self.btn_refresh, 0, wx.RIGHT, 8)
         btns.Add(self.btn_copy, 0, wx.RIGHT, 8)
         btns.Add(self.btn_map, 0)
@@ -1389,8 +1567,15 @@ class MainFrame(wx.Frame):
 
     def _build_server_box(self, panel, left):
         """Kotak 'Server Speedtest LAN' di paling bawah sisi kiri."""
-        box = wx.StaticBoxSizer(wx.VERTICAL, panel, "Server Speedtest LAN")
+        box = wx.StaticBoxSizer(wx.VERTICAL, panel)
         sb = box.GetStaticBox()
+
+        title = wx.StaticText(sb, label="Server Speedtest LAN")
+        tf = title.GetFont()
+        tf.SetWeight(wx.FONTWEIGHT_BOLD)
+        title.SetFont(tf)
+        self.t_text.append(title)
+        box.Add(title, 0, wx.LEFT | wx.TOP, 8)
 
         # bandwidth bar (di atas tombol)
         bars = wx.BoxSizer(wx.HORIZONTAL)
@@ -1408,6 +1593,8 @@ class MainFrame(wx.Frame):
         port_lbl = wx.StaticText(sb, label="PORT:")
         self.srv_port = wx.TextCtrl(sb, value=str(SERVER_DEFAULT_PORT), size=(70, -1),
                                     style=wx.TE_CENTER)
+        self.t_inputs.append(self.srv_port)
+        self.t_text.append(port_lbl)
         row.Add(self.srv_start_btn, 1, wx.EXPAND | wx.RIGHT, 6)
         row.Add(self.srv_stop_btn, 1, wx.EXPAND | wx.RIGHT, 10)
         row.Add(port_lbl, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
@@ -1436,10 +1623,19 @@ class MainFrame(wx.Frame):
         caption = wx.StaticText(
             panel,
             label="Network Tools - IP / Alamat Web / Teks QR      (IP SCANNER: 192.168.1.1-192.168.1.254)")
-        caption.SetForegroundColour(wx.Colour(100, 110, 125))
-        right.Add(caption, 0, wx.LEFT | wx.RIGHT | wx.TOP, 16)
+        self.t_dim.append(caption)
+
+        # tombol ikon Mode Malam (bulan) & Mode Siang (matahari) - pojok kanan atas
+        self.btn_night = ThemeButton(panel, "moon", "Mode Malam", lambda: self.apply_theme("night"))
+        self.btn_day = ThemeButton(panel, "sun", "Mode Siang", lambda: self.apply_theme("day"))
+        top = wx.BoxSizer(wx.HORIZONTAL)
+        top.Add(caption, 1, wx.ALIGN_CENTER_VERTICAL)
+        top.Add(self.btn_night, 0, wx.LEFT, 6)
+        top.Add(self.btn_day, 0, wx.LEFT, 4)
+        right.Add(top, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 16)
 
         self.host = wx.TextCtrl(panel, value="8.8.8.8", style=wx.TE_PROCESS_ENTER)
+        self.t_inputs.append(self.host)
         right.Add(self.host, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 16)
 
         # baris 1: tujuh tombol alat
@@ -1500,7 +1696,7 @@ class MainFrame(wx.Frame):
         # radio button satuan speedtest (tepat di atas kotak output)
         unit_row = wx.BoxSizer(wx.HORIZONTAL)
         unit_lbl = wx.StaticText(panel, label="Satuan speedtest:")
-        unit_lbl.SetForegroundColour(wx.Colour(100, 110, 125))
+        self.t_dim.append(unit_lbl)
         self.rb_mbps = wx.RadioButton(panel, label="Mbps", style=wx.RB_GROUP)
         self.rb_mbs = wx.RadioButton(panel, label="MB/s")
         self.rb_mbps.SetValue(True)
@@ -1748,7 +1944,7 @@ class MainFrame(wx.Frame):
         self.show_view("qr")
         n = len(matrix)
         self.big.SetLabel("QR")
-        self.big.SetForegroundColour(wx.Colour(30, 35, 45))
+        self.big.SetForegroundColour(THEME["text"])
         D, S = StatsBar.DARK, StatsBar.SEP
         self.stats_bar.set_lines([
             [("panjang data : ", D), (f"{len(text)} karakter", D), (" | ", S),
@@ -1778,6 +1974,55 @@ class MainFrame(wx.Frame):
             wx.MessageBox("Gagal menyimpan file.", "QR Generator", wx.OK | wx.ICON_ERROR)
 
     # ------------------------------------------------ Toggle panel kiri (v5)
+    # ------------------------------------------------ Mode siang / malam (v7)
+    def _set_bg_recursive(self, win, bg):
+        for ch in win.GetChildren():
+            if isinstance(ch, (wx.StaticText, wx.RadioButton)):
+                ch.SetBackgroundColour(bg)
+            elif isinstance(ch, wx.StaticBox):
+                ch.SetBackgroundColour(bg)
+                self._set_bg_recursive(ch, bg)
+
+    def apply_theme(self, name, save=True):
+        self.theme_name = name
+        THEME.update(THEMES[name])
+        StatsBar.DARK = THEME["text"]
+        bg, fg = THEME["bg"], THEME["text"]
+
+        self.panel.SetBackgroundColour(bg)
+        self._set_bg_recursive(self.panel, bg)
+        for kp, vp, key, val, i in self.t_rows:
+            c = THEME["row_a"] if i % 2 == 0 else THEME["row_b"]
+            for w in (kp, vp, key, val):
+                w.SetBackgroundColour(c)
+        for w in self.t_text:
+            w.SetForegroundColour(fg)
+        for w in self.t_dim:
+            w.SetForegroundColour(THEME["dim"])
+        for rb in (self.rb_mbps, self.rb_mbs):
+            rb.SetForegroundColour(fg)
+        for w in self.t_inputs + [self.log]:
+            w.SetBackgroundColour(THEME["input_bg"])
+            w.SetForegroundColour(THEME["input_fg"])
+        try:
+            attr = wx.TextAttr(THEME["input_fg"], THEME["input_bg"])
+            self.log.SetStyle(0, self.log.GetLastPosition(), attr)
+            self.log.SetDefaultStyle(attr)
+        except Exception:
+            pass
+        self.toggle_btn.SetBackgroundColour(THEME["tog_bg"])
+        self.toggle_btn.SetForegroundColour(THEME["tog_fg"])
+        if self.big.GetForegroundColour() not in (GREEN, RED):
+            self.big.SetForegroundColour(fg)
+
+        self.btn_day.set_active(name == "day")
+        self.btn_night.set_active(name == "night")
+        self.panel.Refresh()
+        for w in self.t_inputs + [self.log, self.toggle_btn]:
+            w.Refresh()
+        if save:
+            save_theme_name(name)
+
     def on_toggle_left(self, _evt=None):
         self.left_visible = not self.left_visible
         self.root.Show(self.left_sizer, self.left_visible)
@@ -1924,7 +2169,7 @@ class MainFrame(wx.Frame):
         self.show_view("gauge" if mode == "speedtest" else "graph")
         self.update_stats()
         self.big.SetLabel("...")
-        self.big.SetForegroundColour(wx.Colour(30, 35, 45))
+        self.big.SetForegroundColour(THEME["text"])
         self.running = True
         self.set_busy(True)
         names = {"ping": "PING", "tracert": "TRACERT", "port": "SCAN PORT",
